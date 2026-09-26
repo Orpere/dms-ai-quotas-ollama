@@ -161,3 +161,11 @@ Verification: full suite green 3× (deterministic) · `shellcheck -s sh fetch-us
 - Live evidence: installed `fetch-usage.sh` run against ollama.com with the session cookie (in-memory only, never stored in the repo) and the key resolved from `~/.local/share/opencode/auth.json` → `{"status":"ok","plan":"pro","used":<n>,"limit":<allowance>,"currency":"USD","resetsAt":<epoch>}`.
 - Daemon evidence: `~/.local/state/DankMaterialShell/plugins/aiQuotas_state.json` → `ollama.status = "plan_only"` (no cookie configured in plugin settings yet).
 - **Cookie installed & meter live (2026-09-26 18:24Z):** `__Secure-session` written to `plugin_settings.json` (mode 600, DMS stopped during the write — see trace; credential itself never enters this repository). Live daemon state: `status:"ok"` with monthly allowance → bar pill shows `$used/$limit`, card shows the plan badge + progress. Rotation/removal: same stop → edit → start sequence, or unset the field in the plugin settings UI.
+
+## Repository publication (2026-09-26)
+
+- **GitHub:** `https://github.com/Orpere/dms-ai-quotas-ollama` (private) — complete installable plugin tree + `patches/` + `install.sh` + documentation; branch `main`, two commits on top of upstream `222184e`.
+- **Pre-push security:** the offline house scanner's pattern hits are limited to intentional test placeholders (`sk-*-test`, `SEKRIT-*`); a *value-exact* scan for the live credentials (Ollama session cookie, DeepSeek key, OpenCode key) found **zero** hits in the working tree and committed history; commit identity is the GitHub noreply address.
+- **Fresh install:** `git clone <repo-url> && ./install.sh` (backs up any existing install).
+- **Patch an existing upstream checkout:** `./install.sh --patch /path/to/dms-ai-quotas` (or `git apply patches/0001-*.patch`).
+- **Local quality gate:** `./scripts/check.sh` (no GitHub Actions by design — zero-cost policy).
