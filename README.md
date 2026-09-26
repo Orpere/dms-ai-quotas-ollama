@@ -63,16 +63,24 @@ The plugin is designed to be extensible - additional AI coding providers can be 
 ## Install
 
 ```sh
-git clone https://github.com/agneswd/dms-ai-quotas \
-          ~/.config/DankMaterialShell/plugins/aiQuotas
+git clone https://github.com/Orpere/dms-ai-quotas-ollama
+cd dms-ai-quotas-ollama
+./install.sh
 ```
 
-Then in DMS:
-1. Open **Settings - Plugins**
-2. Click **Scan for Plugins**
-3. Enable **AI Quotas**
-4. Add to DankBar layout (**Settings - DankBar Layout**)
-5. Restart shell: `dms restart`
+The installer copies the plugin into
+`~/.config/DankMaterialShell/plugins/aiQuotas` (backing up any existing
+installation first) and prints the remaining steps. Then in DMS:
+
+1. Open **Settings - Plugins** and click **Scan for Plugins**
+2. Enable **AI Quotas**
+3. Add the widget to the bar (**Settings - DankBar Layout**)
+4. Restart the shell: `dms restart`
+
+To update later: `git pull && ./install.sh`. Prefer cloning straight into the
+plugins directory, patching an existing upstream checkout, or uninstalling?
+See [INSTALL.md](INSTALL.md). For Ollama Cloud credentials (API key and the
+optional session cookie), see [INSTALL.md](INSTALL.md#e-ollama-cloud-credentials).
 
 ## Settings
 
@@ -131,7 +139,7 @@ Claude Code provides quota data after the first response in a session. If you al
 
 ## How it works
 
-The plugin captures Claude Code's native `rate_limits` status data locally and polls its usage endpoint at most every five minutes when native data is stale. It reads the local Codex OAuth token from `CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and queries the Codex usage endpoint, reads the OpenCode Go API key from plugin settings or `OPENCODE_DATA_DIR/auth.json` (default `~/.local/share/opencode/auth.json`) and queries `opencode.ai/zen/go/v1/usage`, reads Antigravity credentials from the system keyring and queries its quota API, queries the DeepSeek balance API, queries the OpenRouter credits API with an API key, and reads the local Grok OAuth token from `GROK_HOME/auth.json` (default `~/.grok/auth.json`) to query Grok billing. DeepSeek's balance endpoint provides account funds and availability, not usage history. No external npm packages required.
+The plugin captures Claude Code's native `rate_limits` status data locally and polls its usage endpoint at most every five minutes when native data is stale. It reads the local Codex OAuth token from `CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and queries the Codex usage endpoint, reads the OpenCode Go API key from plugin settings or `OPENCODE_DATA_DIR/auth.json` (default `~/.local/share/opencode/auth.json`) and queries `opencode.ai/zen/go/v1/usage`, reads Antigravity credentials from the system keyring and queries its quota API, queries the DeepSeek balance API, queries the OpenRouter credits API with an API key, fetches the Ollama Cloud plan from `POST ollama.com/api/me` and parses `ollama.com/settings` for monthly included usage when a session cookie is configured, and reads the local Grok OAuth token from `GROK_HOME/auth.json` (default `~/.grok/auth.json`) to query Grok billing. DeepSeek's balance endpoint provides account funds and availability, not usage history. No external npm packages required.
 
 ```
 Claude native data + 5m fallback   ---> local usage snapshot --------------\
@@ -140,11 +148,12 @@ OpenCode auth.json or API key      ---> opencode.ai/zen/go/v1/usage        --\
 System keyring                     ---> Google quota API                    ----> fetch-usage.sh ---> cache ---> Widget
 curl api.deepseek.com/user/balance  ---> [Fetch API balance]                 --\
 openrouter.ai/api/v1/credits        ---> [Fetch credit balance]              --\
+Ollama key + session cookie         ---> [Plan + monthly usage]              --\
 Grok auth.json                     ---> cli-chat-proxy.grok.com/v1/billing --/
 ```
 
 ## License
 
-MIT
+MIT — based on [agneswd/dms-ai-quotas](https://github.com/agneswd/dms-ai-quotas) (see the About note above).
 
 The settings UI uses selected components from [dms-common](https://github.com/hthienloc/dms-common) by Loc Huynh.

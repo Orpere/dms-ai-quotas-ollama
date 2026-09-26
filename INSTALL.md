@@ -6,6 +6,18 @@ This repository is both a **fresh installation** (the full plugin tree) and a
 
 Requirements: DankMaterialShell >= 1.5.0, `curl`, `jq`.
 
+## TL;DR
+
+```sh
+git clone https://github.com/Orpere/dms-ai-quotas-ollama
+cd dms-ai-quotas-ollama
+./install.sh
+dms restart
+```
+
+Then in DMS: **Settings > Plugins > Scan for Plugins** → enable **AI Quotas** →
+add the widget in **Settings > DankBar Layout**. Detailed flows below.
+
 ---
 
 ## A. Fresh installation
@@ -13,7 +25,7 @@ Requirements: DankMaterialShell >= 1.5.0, `curl`, `jq`.
 ### Option 1 — installer script
 
 ```sh
-git clone <this-repository-url> dms-ai-quotas-ollama
+git clone https://github.com/Orpere/dms-ai-quotas-ollama
 cd dms-ai-quotas-ollama
 ./install.sh
 ```
@@ -27,7 +39,7 @@ location.
 ### Option 2 — clone straight into the plugins directory
 
 ```sh
-git clone <this-repository-url> \
+git clone https://github.com/Orpere/dms-ai-quotas-ollama \
   "${XDG_CONFIG_HOME:-$HOME/.config}/DankMaterialShell/plugins/aiQuotas"
 ```
 
