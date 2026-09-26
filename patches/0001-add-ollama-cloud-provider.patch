@@ -1,0 +1,2361 @@
+From a4a2081b2f0e1cf1bfac183b5ab8977e1efb455a Mon Sep 17 00:00:00 2001
+From: Orpere <23037260+Orpere@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:31:09 +0100
+Subject: [PATCH] feat(ollama): add Ollama Cloud provider (plan + monthly
+ usage)
+
+Adds an "Ollama Cloud" provider to AI Quotas:
+- plan name via POST https://ollama.com/api/me (API key, with opencode
+  auth.json fallback)
+- monthly included usage ($used of $limit) and reset time by parsing
+  https://ollama.com/settings with a __Secure-session cookie (Ollama
+  exposes no usage API; see ollama/ollama#12532)
+- popout tab/card with plan badge, usage bar, reset label and pin
+  button; bar-pill entry; plan_only/unavailable/error states
+- settings: provider toggle + optional API key and session cookie fields
+- tests: test-ollama.sh (15 cases), test-ollama-edge.sh (8 cases),
+  sanitized settings-page fixture; existing harnesses set
+  AIQ_OLLAMA_ENABLED=0 for isolation
+- hardening: CRLF/whitespace scrubbing for credentials, ISO-8601 reset
+  normalization, whitespace-tolerant meter parsing
+
+Based on upstream agneswd/dms-ai-quotas @ 222184e.
+---
+ AiQuotasDaemon.qml                  |  11 +-
+ AiQuotasSettings.qml                |  37 +-
+ AiQuotasWidget.qml                  | 277 ++++++++-
+ README.md                           |  22 +-
+ assets/ollama-logo.svg              |   4 +
+ fetch-usage.sh                      | 207 ++++++-
+ plugin.json                         |   4 +-
+ tests/fixtures/ollama-settings.html | 887 ++++++++++++++++++++++++++++
+ tests/test-cache.sh                 |   1 +
+ tests/test-claude-native.sh         |   1 +
+ tests/test-grok.sh                  |   3 +
+ tests/test-ollama-edge.sh           | 199 +++++++
+ tests/test-ollama.sh                | 266 +++++++++
+ tests/test-opencode.sh              |   1 +
+ tests/test-openrouter.sh            |   1 +
+ 15 files changed, 1900 insertions(+), 21 deletions(-)
+ create mode 100644 assets/ollama-logo.svg
+ create mode 100644 tests/fixtures/ollama-settings.html
+ create mode 100644 tests/test-ollama-edge.sh
+ create mode 100644 tests/test-ollama.sh
+
+diff --git a/AiQuotasDaemon.qml b/AiQuotasDaemon.qml
+index 6c7770f..58ff94f 100644
+--- a/AiQuotasDaemon.qml
++++ b/AiQuotasDaemon.qml
+@@ -16,9 +16,12 @@ PluginComponent {
+     property bool openRouterEnabled: pluginData.openRouterEnabled !== false
+     property bool antigravityEnabled: pluginData.antigravityEnabled !== false
+     property bool grokEnabled: pluginData.grokEnabled !== false
++    property bool ollamaEnabled: pluginData.ollamaEnabled !== false
+     property string deepSeekApiKey: pluginData.deepSeekApiKey || ""
+     property string openRouterApiKey: pluginData.openRouterApiKey || ""
+     property string openCodeApiKey: pluginData.openCodeApiKey || ""
++    property string ollamaApiKey: pluginData.ollamaApiKey || ""
++    property string ollamaSessionCookie: pluginData.ollamaSessionCookie || ""
+     property string pluginDir: {
+         var url = Qt.resolvedUrl(".")
+         var path = url.toString()
+@@ -52,10 +55,13 @@ PluginComponent {
+             "AIQ_OPENROUTER_ENABLED=" + (root.openRouterEnabled ? "1" : "0"),
+             "AIQ_GROK_ENABLED=" + (root.grokEnabled ? "1" : "0"),
+             "AIQ_ANTIGRAVITY_ENABLED=" + (root.antigravityEnabled ? "1" : "0"),
++            "AIQ_OLLAMA_ENABLED=" + (root.ollamaEnabled ? "1" : "0"),
+             "AIQ_FORCE_REFRESH=" + (root.activeForce ? "1" : "0"),
+             "DEEPSEEK_API_KEY=" + root.deepSeekApiKey,
+             "OPENROUTER_API_KEY=" + root.openRouterApiKey,
+             "OPENCODE_GO_API_KEY=" + root.openCodeApiKey,
++            "OLLAMA_API_KEY=" + root.ollamaApiKey,
++            "OLLAMA_SESSION_COOKIE=" + root.ollamaSessionCookie,
+             "sh", root.pluginDir + "fetch-usage.sh"
+         ]
+         stdout: SplitParser {
+@@ -81,8 +87,9 @@ PluginComponent {
+ 
+     function fetchSignature() {
+         return [claudeEnabled, codexEnabled, openCodeEnabled, deepSeekEnabled,
+-            openRouterEnabled, antigravityEnabled, grokEnabled, deepSeekApiKey,
+-            openRouterApiKey, openCodeApiKey].join("\u001f")
++            openRouterEnabled, antigravityEnabled, grokEnabled, ollamaEnabled,
++            deepSeekApiKey, openRouterApiKey, openCodeApiKey, ollamaApiKey,
++            ollamaSessionCookie].join("\u001f")
+     }
+ 
+     function requestFetch(force) {
+diff --git a/AiQuotasSettings.qml b/AiQuotasSettings.qml
+index 389ace6..0af0d9a 100644
+--- a/AiQuotasSettings.qml
++++ b/AiQuotasSettings.qml
+@@ -11,13 +11,14 @@ PluginSettings {
+         SectionTitle {
+             text: I18n.tr("Providers")
+             icon: "smart_toy"
+-            showReset: claudeEnabled.isDirty || codexEnabled.isDirty || openCodeEnabled.isDirty || deepSeekEnabled.isDirty || openRouterEnabled.isDirty || grokEnabled.isDirty || antigravityEnabled.isDirty
++            showReset: claudeEnabled.isDirty || codexEnabled.isDirty || openCodeEnabled.isDirty || deepSeekEnabled.isDirty || openRouterEnabled.isDirty || ollamaEnabled.isDirty || grokEnabled.isDirty || antigravityEnabled.isDirty
+             onResetClicked: {
+                 claudeEnabled.resetToDefault()
+                 codexEnabled.resetToDefault()
+                 openCodeEnabled.resetToDefault()
+                 deepSeekEnabled.resetToDefault()
+                 openRouterEnabled.resetToDefault()
++                ollamaEnabled.resetToDefault()
+                 grokEnabled.resetToDefault()
+                 antigravityEnabled.resetToDefault()
+             }
+@@ -73,6 +74,16 @@ PluginSettings {
+ 
+         Separator {}
+ 
++        ToggleSettingPlus {
++            id: ollamaEnabled
++            settingKey: "ollamaEnabled"
++            label: I18n.tr("Ollama Cloud")
++            description: I18n.tr("Show your Ollama Cloud plan and monthly included usage.")
++            defaultValue: true
++        }
++
++        Separator {}
++
+         ToggleSettingPlus {
+             id: grokEnabled
+             settingKey: "grokEnabled"
+@@ -157,11 +168,13 @@ PluginSettings {
+         SectionTitle {
+             text: I18n.tr("Credentials")
+             icon: "key"
+-            showReset: deepSeekApiKey.isDirty || openRouterApiKey.isDirty || openCodeApiKey.isDirty
++            showReset: deepSeekApiKey.isDirty || openRouterApiKey.isDirty || openCodeApiKey.isDirty || ollamaApiKey.isDirty || ollamaSessionCookie.isDirty
+             onResetClicked: {
+                 deepSeekApiKey.resetToDefault()
+                 openRouterApiKey.resetToDefault()
+                 openCodeApiKey.resetToDefault()
++                ollamaApiKey.resetToDefault()
++                ollamaSessionCookie.resetToDefault()
+             }
+         }
+ 
+@@ -195,5 +208,25 @@ PluginSettings {
+             placeholder: "sk-..."
+             defaultValue: ""
+         }
++
++        Separator {}
++
++        StringSettingPlus {
++            id: ollamaApiKey
++            settingKey: "ollamaApiKey"
++            label: I18n.tr("Ollama Cloud API Key")
++            description: I18n.tr("Optional. Create a key at ollama.com/settings/keys. Shows your plan name.")
++            defaultValue: ""
++        }
++
++        Separator {}
++
++        StringSettingPlus {
++            id: ollamaSessionCookie
++            settingKey: "ollamaSessionCookie"
++            label: I18n.tr("Ollama Cloud Session Cookie")
++            description: I18n.tr("Optional. Paste the __Secure-session cookie value from your browser after signing in at ollama.com to show monthly usage. Grants full account access - keep it private.")
++            defaultValue: ""
++        }
+     }
+ }
+diff --git a/AiQuotasWidget.qml b/AiQuotasWidget.qml
+index 18f6a00..6e9e561 100644
+--- a/AiQuotasWidget.qml
++++ b/AiQuotasWidget.qml
+@@ -17,6 +17,9 @@ PluginComponent {
+     property bool grokEnabled: pluginData.grokEnabled !== false
+     property string deepSeekApiKey: pluginData.deepSeekApiKey || ""
+     property string openRouterApiKey: pluginData.openRouterApiKey || ""
++    property bool ollamaEnabled: pluginData.ollamaEnabled !== false
++    property string ollamaApiKey: pluginData.ollamaApiKey || ""
++    property string ollamaSessionCookie: pluginData.ollamaSessionCookie || ""
+     property string displayMode: pluginData.displayMode || "remaining"
+     property bool showResetTime: pluginData.showResetTime !== false
+     property bool showResetCountdown: pluginData.showResetCountdown === true
+@@ -79,11 +82,11 @@ PluginComponent {
+         }
+     }
+ 
+-    readonly property var providerIds: ["claude", "codex", "opencode", "deepseek", "openrouter", "grok", "antigravity"]
++    readonly property var providerIds: ["claude", "codex", "opencode", "deepseek", "openrouter", "ollama", "grok", "antigravity"]
+ 
+     function defaultPinState() {
+         var openCodePin = savedSetting("pinnedWindow", "Rolling") || "Rolling"
+-        return { claude: ["5h"], codex: ["5h"], opencode: [openCodePin], deepseek: ["balance"], openrouter: ["balance"], grok: ["Billing"], antigravity: ["Gemini Models - Five Hour Limit Remaining"] }
++        return { claude: ["5h"], codex: ["5h"], opencode: [openCodePin], deepseek: ["balance"], openrouter: ["balance"], ollama: ["usage"], grok: ["Billing"], antigravity: ["Gemini Models - Five Hour Limit Remaining"] }
+     }
+ 
+     function savedSetting(key, fallback) {
+@@ -156,6 +159,7 @@ PluginComponent {
+     function pinnedAntigravityEntries() { return pinnedEntries("antigravity", antigravityEntries()) }
+     function deepSeekPinned() { return isPinned("deepseek", "balance") }
+     function openRouterPinned() { return isPinned("openrouter", "balance") }
++    function ollamaPinned() { return isPinned("ollama", "usage") }
+ 
+     function providerEnabled(provider) {
+         if (provider === "claude") return claudeEnabled
+@@ -163,6 +167,7 @@ PluginComponent {
+         if (provider === "opencode") return openCodeEnabled
+         if (provider === "deepseek") return deepSeekEnabled
+         if (provider === "openrouter") return openRouterEnabled
++        if (provider === "ollama") return ollamaEnabled
+         if (provider === "grok") return grokEnabled
+         if (provider === "antigravity") return antigravityEnabled
+         return false
+@@ -175,6 +180,7 @@ PluginComponent {
+         if (openCodeEnabled) out.push({ id: "opencode", label: "OpenCode", icon: "assets/opencode-logo.svg" })
+         if (deepSeekEnabled) out.push({ id: "deepseek", label: "DeepSeek", icon: "assets/deepseek-logo.svg" })
+         if (openRouterEnabled) out.push({ id: "openrouter", label: "OpenRouter", icon: "assets/openrouter-logo.svg" })
++        if (ollamaEnabled) out.push({ id: "ollama", label: "Ollama Cloud", icon: "assets/ollama-logo.svg" })
+         if (grokEnabled) out.push({ id: "grok", label: "Grok", icon: "assets/grok-logo.svg" })
+         if (antigravityEnabled) out.push({ id: "antigravity", label: "Antigravity", icon: "assets/antigravity-logo.svg" })
+         return out
+@@ -250,6 +256,40 @@ PluginComponent {
+         return openRouterEnabled && openRouterPinned() && orBalance() != null
+     }
+ 
++    function ollamaUsage() {
++        try {
++            if (!usageData || !usageData.ollama) return null
++            if (usageData.ollama.status !== "ok") return null
++            return usageData.ollama
++        } catch (e) { return null }
++    }
++
++    function ollamaPlan() {
++        try {
++            if (!usageData || !usageData.ollama) return ""
++            var st = usageData.ollama.status
++            if (st !== "ok" && st !== "plan_only") return ""
++            var plan = usageData.ollama.plan
++            if (!plan) return ""
++            return plan.charAt(0).toUpperCase() + plan.slice(1)
++        } catch (e) { return "" }
++    }
++
++    function hasOllama() {
++        return ollamaEnabled && ollamaPinned() && ollamaUsage() != null
++    }
++
++    function ollamaUsedPct() {
++        try {
++            var u = ollamaUsage()
++            if (!u) return 0
++            var used = parseFloat(u.used)
++            var limit = parseFloat(u.limit)
++            if (!isFinite(used) || !isFinite(limit) || limit <= 0) return 0
++            return Math.max(0, Math.min(100, used / limit * 100))
++        } catch (e) { return 0 }
++    }
++
+     function grokEntries() {
+         try {
+             if (!usageData || !usageData.grok) return []
+@@ -390,6 +430,16 @@ PluginComponent {
+         } catch (e) { return "--" }
+     }
+ 
++    function fmtUsd(value) {
++        try {
++            var amount = parseFloat(value)
++            if (!isFinite(amount)) return "--"
++            var s = (Math.round(amount * 100) % 100 === 0)
++                ? amount.toFixed(0) : amount.toFixed(2)
++            return "$" + s
++        } catch (e) { return "--" }
++    }
++
+     function pctStr(pct) {
+         try {
+             if (pct < 0) return "--"
+@@ -457,7 +507,7 @@ PluginComponent {
+ 
+                 // Separator after Claude
+                 Rectangle {
+-                    visible: root.pinnedClaudeEntries().length > 0 && (root.pinnedCodexEntries().length > 0 || root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
++                    visible: root.pinnedClaudeEntries().length > 0 && (root.pinnedCodexEntries().length > 0 || root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                     width: 1
+                     height: pill.height - 8
+                     color: Theme.outlineVariant
+@@ -489,7 +539,7 @@ PluginComponent {
+ 
+                 // Separator after Codex
+                 Rectangle {
+-                    visible: root.pinnedCodexEntries().length > 0 && (root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
++                    visible: root.pinnedCodexEntries().length > 0 && (root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                     width: 1
+                     height: pill.height - 8
+                     color: Theme.outlineVariant
+@@ -521,7 +571,7 @@ PluginComponent {
+ 
+                 // Separator after OpenCode
+                 Rectangle {
+-                    visible: root.pinnedOpenCodeEntries().length > 0 && (root.hasDeepSeek() || root.hasOpenRouter() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
++                    visible: root.pinnedOpenCodeEntries().length > 0 && (root.hasDeepSeek() || root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                     width: 1
+                     height: pill.height - 8
+                     color: Theme.outlineVariant
+@@ -553,7 +603,7 @@ PluginComponent {
+ 
+                 // Separator after DeepSeek
+                 Rectangle {
+-                    visible: root.hasDeepSeek() && (root.hasOpenRouter() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
++                    visible: root.hasDeepSeek() && (root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                     width: 1
+                     height: pill.height - 8
+                     color: Theme.outlineVariant
+@@ -585,7 +635,42 @@ PluginComponent {
+ 
+                 // Separator after OpenRouter
+                 Rectangle {
+-                    visible: root.hasOpenRouter() && (root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
++                    visible: root.hasOpenRouter() && (root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
++                    width: 1
++                    height: pill.height - 8
++                    color: Theme.outlineVariant
++                    opacity: 0.4
++                    anchors.verticalCenter: parent.verticalCenter
++                }
++
++                // Ollama usage
++                Repeater {
++                    model: root.hasOllama() ? [1] : []
++                    delegate: Row {
++                        spacing: 4
++                        Image {
++                            source: root.pluginDir + "assets/ollama-logo.svg"
++                            sourceSize.width: 14
++                            sourceSize.height: 14
++                            width: 14; height: 14
++                            fillMode: Image.PreserveAspectFit
++                            anchors.verticalCenter: parent.verticalCenter
++                        }
++                        StyledText {
++                            text: {
++                                var u = root.ollamaUsage()
++                                return u ? root.fmtUsd(u.used) + "/" + root.fmtUsd(u.limit) : "--"
++                            }
++                            color: Theme.surfaceText
++                            font.pixelSize: Theme.fontSizeMedium
++                            anchors.verticalCenter: parent.verticalCenter
++                        }
++                    }
++                }
++
++                // Separator after Ollama
++                Rectangle {
++                    visible: root.hasOllama() && (root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                     width: 1
+                     height: pill.height - 8
+                     color: Theme.outlineVariant
+@@ -783,6 +868,30 @@ PluginComponent {
+                     }
+                 }
+ 
++                Repeater {
++                    model: root.hasOllama() ? [1] : []
++                    delegate: Column {
++                        spacing: 1
++                        Image {
++                            source: root.pluginDir + "assets/ollama-logo.svg"
++                            sourceSize.width: 14
++                            sourceSize.height: 14
++                            width: 14; height: 14
++                            fillMode: Image.PreserveAspectFit
++                            anchors.horizontalCenter: parent.horizontalCenter
++                        }
++                        StyledText {
++                            text: {
++                                var u = root.ollamaUsage()
++                                return u ? root.fmtUsd(u.used) : "--"
++                            }
++                            color: Theme.surfaceText
++                            font.pixelSize: Theme.fontSizeSmall
++                            anchors.horizontalCenter: parent.horizontalCenter
++                        }
++                    }
++                }
++
+                 Repeater {
+                     model: root.pinnedGrokEntries()
+                     delegate: Column {
+@@ -1659,6 +1768,160 @@ PluginComponent {
+                         }
+                     }
+ 
++                    // --- Ollama card ---
++                    StyledRect {
++                        visible: root.selectedProvider === "ollama" && root.ollamaEnabled
++                        width: parent.width
++                        height: ollamaCard.implicitHeight + Theme.spacingM * 2
++                        radius: Theme.cornerRadius
++                        color: Theme.surfaceContainerHigh
++
++                        Column {
++                            id: ollamaCard
++                            anchors.fill: parent
++                            anchors.margins: Theme.spacingM
++                            spacing: Theme.spacingS
++
++                            Row {
++                                width: parent.width
++                                spacing: Theme.spacingS
++
++                                StyledText {
++                                    text: "Ollama Cloud"
++                                    color: Theme.surfaceVariantText
++                                    font.pixelSize: Theme.fontSizeSmall
++                                    font.weight: Font.Bold
++                                    anchors.verticalCenter: parent.verticalCenter
++                                }
++
++                                Rectangle {
++                                    visible: root.ollamaPlan() !== ""
++                                    height: 18
++                                    width: ollamaPlanBadgeText.implicitWidth + 16
++                                    radius: 9
++                                    color: Theme.surfaceSelected
++                                    border.color: Theme.outlineVariant
++                                    border.width: 1
++                                    anchors.verticalCenter: parent.verticalCenter
++
++                                    StyledText {
++                                        id: ollamaPlanBadgeText
++                                        anchors.centerIn: parent
++                                        text: root.ollamaPlan() + " plan"
++                                        color: Theme.primary
++                                        font.pixelSize: Theme.fontSizeSmall
++                                        font.weight: Font.Bold
++                                    }
++                                }
++                            }
++
++                            // Ollama monthly usage
++                            Repeater {
++                                model: root.ollamaUsage() ? [root.ollamaUsage()] : []
++                                delegate: Column {
++                                    width: parent.width
++                                    spacing: Theme.spacingS
++                                    Row {
++                                        width: parent.width
++                                        spacing: Theme.spacingM
++                                        Image {
++                                            source: root.pluginDir + "assets/ollama-logo.svg"
++                                            sourceSize.width: 28
++                                            sourceSize.height: 28
++                                            width: 28; height: 28
++                                            fillMode: Image.PreserveAspectFit
++                                            anchors.verticalCenter: parent.verticalCenter
++                                        }
++                                        Column {
++                                            width: parent.width - 40 - 28 - Theme.spacingM
++                                            anchors.verticalCenter: parent.verticalCenter
++                                            spacing: 2
++                                            StyledText {
++                                                text: "Monthly included usage"
++                                                color: Theme.surfaceVariantText
++                                                font.pixelSize: Theme.fontSizeSmall
++                                            }
++                                            StyledText {
++                                                text: root.fmtUsd(modelData.used) + " of " + root.fmtUsd(modelData.limit) + " used"
++                                                color: Theme.surfaceText
++                                                font.pixelSize: Theme.fontSizeLarge
++                                                font.weight: Font.Bold
++                                            }
++                                        }
++                                        Rectangle {
++                                            width: 28; height: 28; radius: 14
++                                            color: root.isPinned("ollama", "usage")
++                                                ? Theme.surfaceSelected
++                                                : (ollamaPinArea.containsMouse ? Theme.surfaceHover : Theme.surfaceContainerHighest)
++                                            border.color: root.isPinned("ollama", "usage")
++                                                ? Theme.outlineMedium : Theme.outlineVariant
++                                            border.width: 1
++                                            anchors.verticalCenter: parent.verticalCenter
++
++                                            MouseArea {
++                                                id: ollamaPinArea
++                                                anchors.fill: parent
++                                                hoverEnabled: true
++                                                cursorShape: Qt.PointingHandCursor
++                                                onClicked: root.togglePin("ollama", "usage")
++                                            }
++
++                                            DankIcon {
++                                                anchors.centerIn: parent
++                                                name: "push_pin"
++                                                size: 17
++                                                color: root.isPinned("ollama", "usage")
++                                                    ? Theme.primary : Theme.surfaceVariantText
++                                                rotation: root.isPinned("ollama", "usage") ? 0 : 45
++                                            }
++                                        }
++                                    }
++                                    Rectangle {
++                                        id: ollamaProgressTrack
++                                        width: parent.width
++                                        height: 8
++                                        radius: 4
++                                        color: Theme.outlineVariant
++                                        Rectangle {
++                                            width: ollamaProgressTrack.width * root.ollamaUsedPct() / 100
++                                            height: parent.height
++                                            radius: parent.radius
++                                            color: root.ollamaUsedPct() >= 90 ? Theme.error : Theme.primary
++                                        }
++                                    }
++                                    StyledText {
++                                        visible: root.showResetTime && modelData.resetsAt > 0
++                                        text: root.resetLabel(modelData.resetsAt)
++                                        color: Theme.surfaceVariantText
++                                        font.pixelSize: Theme.fontSizeSmall
++                                    }
++                                }
++                            }
++
++                            // Ollama plan_only / unavailable / error / loading
++                            StyledText {
++                                visible: root.ollamaUsage() == null
++                                width: parent.width
++                                wrapMode: Text.WordWrap
++                                color: {
++                                    var o = root.usageData && root.usageData.ollama
++                                    return o && (o.reason === "auth_expired" || o.reason === "access_denied")
++                                        ? Theme.warning : Theme.surfaceVariantText
++                                }
++                                font.pixelSize: Theme.fontSizeSmall
++                                text: {
++                                    if (!root.usageData) return "Loading..."
++                                    var o = root.usageData.ollama
++                                    if (!o) return "No Ollama Cloud data."
++                                    if (o.status === "plan_only") return o.error || "Add a session cookie in plugin settings to see monthly usage."
++                                    if (o.status === "unavailable") return "Ollama Cloud is not configured. Add an API key or session cookie in plugin settings."
++                                    if (o.status === "error") return o.error || "Could not load Ollama Cloud data."
++                                    return "No Ollama Cloud data."
++                                }
++                            }
++                        }
++                    }
++
+                     // --- Grok card ---
+                     StyledRect {
+                         visible: root.selectedProvider === "grok" && root.grokEnabled
+diff --git a/README.md b/README.md
+index 8115a5f..63a15b4 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,13 @@
+ # dms-ai-quotas
+ 
+-Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, and Grok usage limits and balances in your [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar.
++Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, Ollama, and Grok usage limits and balances in your [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar.
++
++> **About this repository.** Community fork of
++> [agneswd/dms-ai-quotas](https://github.com/agneswd/dms-ai-quotas) that adds an
++> **Ollama Cloud** provider (plan + monthly included usage). It is based on upstream
++> `main` at `222184e`. See [INSTALL.md](INSTALL.md) for fresh-install and patching
++> instructions, [SECURITY.md](SECURITY.md) for credential handling, and
++> [CHANGELOG.md](CHANGELOG.md) for what changed.
+ 
+ <p align="center">
+   <img src="assets/screenshot.png" alt="AI Quotas popout" width="500"/>
+@@ -16,26 +23,28 @@ Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, and Grok usa
+ | **Antigravity** | Agent/model usage quotas | Claude, Gemini Pro, Gemini Flash, Gemini Image usage % and reset times |
+ | **DeepSeek API** | Account balance | Available total, API availability, unexpired grants, and paid top-ups |
+ | **OpenRouter** | Account credit balance | Remaining credits, purchased total, and usage |
++| **Ollama Cloud** | Plan + monthly included usage | Plan name and `$used of $limit` monthly included usage with reset time |
+ | **Grok** | Usage limits | Shared weekly usage % with reset countdown, from local `grok login` |
+ 
+ The plugin is designed to be extensible - additional AI coding providers can be added in the future.
+ 
+ ## Features
+ 
+-- Merged bar pill showing provider logos, pinned percentages, and DeepSeek and OpenRouter balances
++- Merged bar pill showing provider logos, pinned percentages, and DeepSeek, OpenRouter, and Ollama Cloud balances
+ - Claude, Codex, OpenCode, and Grok pinned percentages in the bar pill, with all supported limits in the popout
+ - Separators between provider sections in the pill
+ - Click to open a tabbed provider popout with clean per-limit detail cards
+-- Pin any Claude, Codex, OpenCode, DeepSeek, or Grok item directly from its popout card
++- Pin any Claude, Codex, OpenCode, DeepSeek, OpenRouter, Ollama Cloud, or Grok item directly from its popout card
+ - Display mode toggle: show remaining % or used % (synced between pill and popout)
+ - Reset date/time or countdown shown for each usage limit
+ - DeepSeek API balance card with availability status, total, unexpired grants, paid top-ups, and logo
+ - OpenRouter credit balance card with remaining, purchased, and used amounts, and logo
++- Ollama Cloud plan card with plan badge, monthly included usage bar, and reset time
+ - Grok usage card from local `grok login` (no API key)
+ - Configurable refresh interval (30s - 300s)
+ - Toggle each provider on/off independently
+ - OpenCode Rolling (5h), Weekly, and Monthly windows are always available in the popout
+-- Claude, Codex, OpenCode, and Grok use local CLI logins. DeepSeek and OpenRouter keys are set in DMS settings.
++- Claude, Codex, OpenCode, and Grok use local CLI logins. DeepSeek and OpenRouter keys are set in DMS settings. Ollama Cloud optionally uses an API key (plan name) and a session cookie (monthly usage).
+ 
+ ## Requirements
+ 
+@@ -44,6 +53,8 @@ The plugin is designed to be extensible - additional AI coding providers can be
+ - For Claude: Claude Code 2.1.220 or newer, installed and signed in (`claude`)
+ - For DeepSeek: an API key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
+ - For OpenRouter: an API key from [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys). If credit access is denied, create a management key at [openrouter.ai/settings/management-keys](https://openrouter.ai/settings/management-keys)
++- For Ollama: an API key from [ollama.com/settings/keys](https://ollama.com/settings/keys) to show your plan name
++- For Ollama usage: a session cookie from [ollama.com](https://ollama.com) (the `__Secure-session` cookie value) — grants full account access, keep it private
+ - For Grok: the Grok CLI installed and authenticated with `grok login`
+ - For Codex: the Codex CLI installed and authenticated with `codex login`
+ - For OpenCode: the OpenCode CLI connected with `/connect` to OpenCode Go, or an API key from [opencode.ai](https://opencode.ai)
+@@ -75,6 +86,7 @@ Then in DMS:
+ | Antigravity | on | Show Antigravity agent and model quotas |
+ | DeepSeek | on | Show DeepSeek account balance |
+ | OpenRouter | on | Show OpenRouter credit balance |
++| Ollama Cloud | on | Show your Ollama Cloud plan and monthly included usage |
+ | Grok | on | Show usage limits from the local Grok login |
+ | Refresh Interval | 60s | How often to fetch data (30-300s) |
+ | Show Reset Times | on | Show reset information in the popout |
+@@ -92,6 +104,8 @@ Claude, Codex, OpenCode, and Grok use their local CLI logins automatically. Sign
+ | DeepSeek API Key | Your DeepSeek API key from platform.deepseek.com/api_keys |
+ | OpenRouter API Key | Your OpenRouter API key from openrouter.ai/settings/keys |
+ | OpenCode Go API Key | Optional. Leave empty to use `~/.local/share/opencode/auth.json` |
++| Ollama Cloud API Key | Optional. Create a key at ollama.com/settings/keys. Shows your plan name |
++| Ollama Cloud Session Cookie | Optional. Paste the `__Secure-session` cookie value from your browser after signing in at ollama.com to show monthly usage. Grants full account access - keep it private |
+ 
+ ### Enable Claude quota capture
+ 
+diff --git a/assets/ollama-logo.svg b/assets/ollama-logo.svg
+new file mode 100644
+index 0000000..da2463e
+--- /dev/null
++++ b/assets/ollama-logo.svg
+@@ -0,0 +1,4 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 17 25">
++  <title>Ollama</title>
++  <path fill="#F1ECEC" fill-rule="evenodd" clip-rule="evenodd" d="M4.40517 0.102088C4.62117 0.198678 4.81617 0.357766 4.99317 0.56799C5.28817 0.915712 5.53718 1.41342 5.72718 2.00318C5.91818 2.59635 6.04218 3.25316 6.08918 3.91224C6.71878 3.5075 7.41754 3.26103 8.13818 3.18953L8.18918 3.18498C9.05919 3.10544 9.91919 3.28384 10.6692 3.72361C10.7702 3.78384 10.8692 3.84861 10.9662 3.91679C11.0162 3.27021 11.1382 2.62817 11.3262 2.04863C11.5162 1.45773 11.7652 0.961166 12.0592 0.612308C12.2235 0.410338 12.4245 0.251368 12.6482 0.146406C12.9052 0.032771 13.1782 0.0123167 13.4442 0.098679C13.8452 0.228223 14.1892 0.516855 14.4602 0.936167C14.7082 1.3191 14.8942 1.81 15.0212 2.39863C15.2512 3.45998 15.2912 4.85655 15.1362 6.54061L15.1892 6.58607L15.2152 6.60766C15.9722 7.26219 16.4992 8.19513 16.7782 9.27807C17.2133 10.9678 16.9943 12.8632 16.2442 13.9235L16.2262 13.9473L16.2282 13.9507C16.6453 14.8166 16.8983 15.7314 16.9523 16.678L16.9543 16.7121C17.0183 17.9223 16.7542 19.1404 16.1402 20.337L16.1332 20.3484L16.1432 20.3756C16.6152 21.6904 16.7632 23.0142 16.5812 24.3369L16.5752 24.3813C16.547 24.5744 16.4525 24.7472 16.3125 24.8612C16.1725 24.9753 15.9983 25.0219 15.8282 24.9903C15.744 24.9753 15.6632 24.9417 15.5904 24.8912C15.5177 24.8408 15.4544 24.7744 15.4042 24.696C15.3541 24.6178 15.318 24.529 15.2981 24.4347C15.2782 24.3406 15.2748 24.2428 15.2882 24.1472C15.4552 22.9733 15.2982 21.7961 14.8082 20.5984C14.7625 20.4871 14.7422 20.3645 14.7492 20.242C14.7562 20.1194 14.7902 20.0009 14.8482 19.8972L14.8522 19.8904C15.4562 18.8404 15.7062 17.8109 15.6522 16.7996C15.6062 15.9143 15.3272 15.045 14.8522 14.2166C14.7598 14.0556 14.7269 13.8597 14.7606 13.6713C14.7943 13.4829 14.8918 13.3171 15.0322 13.2098L15.0412 13.203C15.2842 13.0223 15.5082 12.561 15.6212 11.9303C15.7459 11.1846 15.7133 10.4159 15.5262 9.68716C15.3212 8.89171 14.9462 8.22809 14.4212 7.77468C13.8262 7.25878 13.0382 7.00992 12.0412 7.08151C11.9108 7.09115 11.7809 7.05613 11.6682 6.98097C11.5556 6.90581 11.4653 6.79399 11.4092 6.65993C11.0952 5.90426 10.6372 5.36336 10.0662 5.02814C9.51799 4.71723 8.90425 4.58657 8.29418 4.65087C7.04918 4.76337 5.95118 5.56108 5.62418 6.56675C5.57792 6.70829 5.4947 6.8304 5.38568 6.91672C5.27666 7.00301 5.14703 7.04942 5.01417 7.0497C3.94717 7.05197 3.12117 7.33606 2.51717 7.84855C1.99517 8.29172 1.63916 8.91103 1.45116 9.65307C1.28104 10.3515 1.25774 11.0857 1.38316 11.7962C1.49516 12.4303 1.71416 12.9553 1.96517 13.2382L1.97317 13.2462C2.18517 13.4814 2.23017 13.8485 2.08217 14.1382C1.72216 14.845 1.45316 15.8984 1.40916 16.9109C1.35916 18.0677 1.59516 19.0722 2.12817 19.7927L2.14417 19.8143C2.22461 19.9208 2.27633 20.0514 2.29319 20.1905C2.31003 20.3295 2.29127 20.4711 2.23917 20.5984C1.66316 22.0029 1.48616 23.1574 1.67716 24.0665C1.71148 24.2556 1.67954 24.4524 1.58812 24.6149C1.4967 24.7776 1.35302 24.8933 1.18766 24.9374C1.0223 24.9817 0.848322 24.9506 0.702741 24.8512C0.557141 24.7517 0.451463 24.5917 0.408163 24.4051C0.165162 23.2483 0.330162 21.9233 0.881162 20.4302L0.895162 20.3904L0.887162 20.3768C0.616341 19.9222 0.414243 19.4195 0.289162 18.8893L0.284162 18.8677C0.132362 18.2062 0.0726416 17.5218 0.107162 16.8393C0.151162 15.8052 0.385163 14.7462 0.729162 13.8962L0.741162 13.8666L0.739162 13.8644C0.446163 13.3894 0.229162 12.7814 0.109162 12.1087L0.104162 12.0814C-0.0611788 11.1431 -0.0293187 10.1737 0.197162 9.25194C0.459163 8.21218 0.974162 7.31901 1.73316 6.67356C1.79316 6.62243 1.85616 6.57129 1.91916 6.52357C1.76016 4.827 1.80016 3.42134 2.03117 2.35317C2.15817 1.76455 2.34517 1.27365 2.59317 0.890713C2.86317 0.472537 3.20717 0.183905 3.60817 0.0532252C3.87417 -0.0331371 4.14817 -0.0126829 4.40517 0.102088ZM8.52118 10.4315C9.45719 10.4315 10.3212 10.7871 10.9672 11.403C11.5972 12.0019 11.9722 12.8064 11.9722 13.6076C11.9722 14.6166 11.5662 15.403 10.8392 15.9052C10.2192 16.3314 9.38819 16.5382 8.43618 16.5382C7.42718 16.5382 6.56518 16.2439 5.94318 15.7041C5.32618 15.17 4.98017 14.42 4.98017 13.6076C4.98017 12.8042 5.37818 11.9973 6.03618 11.3962C6.70418 10.786 7.58618 10.4315 8.52118 10.4315ZM8.52118 11.4496C7.82742 11.4428 7.15204 11.7031 6.60518 12.1883C6.14418 12.6087 5.88318 13.1371 5.88318 13.6087C5.88318 14.095 6.09318 14.5507 6.49318 14.8973C6.94818 15.2916 7.61718 15.52 8.43618 15.52C9.23519 15.52 9.90919 15.353 10.3682 15.0359C10.8312 14.7178 11.0682 14.2564 11.0682 13.6076C11.0682 13.1269 10.8222 12.5962 10.3852 12.1803C9.90119 11.7201 9.24519 11.4496 8.52118 11.4496ZM9.18319 12.8246L9.18719 12.8292C9.30719 13.0007 9.28219 13.2496 9.13119 13.386L8.83919 13.6473V14.1541C8.83865 14.267 8.79877 14.375 8.72829 14.4544C8.6578 14.5339 8.56246 14.5783 8.46318 14.578C8.3639 14.5783 8.26856 14.5339 8.19808 14.4544C8.12758 14.375 8.0877 14.267 8.08718 14.1541V13.6314L7.81618 13.3837C7.78042 13.3511 7.7507 13.3109 7.72872 13.2652C7.70674 13.2195 7.69294 13.1694 7.6881 13.1176C7.68326 13.0658 7.6875 13.0135 7.70056 12.9636C7.71362 12.9137 7.73524 12.8672 7.76418 12.8269C7.8232 12.7452 7.9082 12.6934 8.0007 12.6825C8.09318 12.6717 8.18572 12.7027 8.25818 12.7689L8.47318 12.9644L8.69318 12.7667C8.76538 12.7018 8.85702 12.6716 8.94854 12.6825C9.04009 12.6933 9.12427 12.7443 9.18319 12.8246ZM4.14317 10.644C4.62117 10.644 5.01017 11.0871 5.01017 11.6337C5.01043 11.8957 4.91917 12.1471 4.75641 12.3327C4.59365 12.5183 4.37273 12.6229 4.14217 12.6235C3.91195 12.6226 3.69143 12.518 3.52893 12.3327C3.36641 12.1474 3.27517 11.8965 3.27517 11.6349C3.27463 11.3729 3.36565 11.1213 3.52821 10.9355C3.69079 10.7497 3.91261 10.6449 4.14317 10.644ZM12.8492 10.644C13.3292 10.644 13.7172 11.0871 13.7172 11.6337C13.7175 11.8957 13.6262 12.1471 13.4634 12.3327C13.3007 12.5183 13.0798 12.6229 12.8492 12.6235C12.619 12.6226 12.3985 12.518 12.236 12.3327C12.0734 12.1474 11.9822 11.8965 11.9822 11.6349C11.9817 11.3729 12.0727 11.1213 12.2352 10.9355C12.3978 10.7497 12.6186 10.6449 12.8492 10.644ZM3.94017 1.47705L3.93717 1.47932C3.82131 1.53657 3.72239 1.63046 3.65217 1.74977L3.64717 1.75659C3.50917 1.97136 3.38917 2.28727 3.29917 2.70203C3.12917 3.48839 3.08317 4.55541 3.17517 5.86335C3.60517 5.7179 4.07417 5.62699 4.57917 5.59404L4.58917 5.5929L4.60817 5.55426C4.65417 5.46108 4.70317 5.37131 4.75617 5.28268C4.87917 4.40655 4.77817 3.35998 4.50317 2.50545C4.36917 2.09182 4.20617 1.76682 4.05017 1.5816C4.01797 1.5431 3.98207 1.5088 3.94317 1.47932L3.94017 1.47705ZM13.1142 1.52251L13.1122 1.52364C13.0733 1.55312 13.0374 1.58741 13.0052 1.62591C12.8492 1.81114 12.6852 2.13727 12.5522 2.5509C12.2622 3.45316 12.1652 4.56905 12.3222 5.47358L12.3802 5.58381L12.3882 5.59972H12.4182C12.9145 5.59988 13.4082 5.68101 13.8842 5.84062C13.9702 4.56337 13.9222 3.51907 13.7562 2.74749C13.6662 2.33272 13.5462 2.01682 13.4072 1.80205L13.4032 1.79523C13.3331 1.67548 13.2342 1.58121 13.1182 1.52364L13.1142 1.52251Z"/>
++</svg>
+diff --git a/fetch-usage.sh b/fetch-usage.sh
+index 3fb7f04..88fc56c 100755
+--- a/fetch-usage.sh
++++ b/fetch-usage.sh
+@@ -1,5 +1,5 @@
+ #!/bin/sh
+-# Fetch Claude, Codex and OpenCode Go usage plus DeepSeek, OpenRouter and Grok balances, merge, cache, and print.
++# Fetch Claude, Codex and OpenCode Go usage plus DeepSeek, OpenRouter, Grok and Ollama Cloud balances, merge, cache, and print.
+ #
+ # Claude: reads native rate-limit data captured from Claude Code's status line
+ # Codex: GET https://chatgpt.com/backend-api/wham/usage using the local Codex login
+@@ -7,6 +7,7 @@
+ # DeepSeek: GET https://api.deepseek.com/user/balance
+ # OpenRouter: GET https://openrouter.ai/api/v1/credits
+ # Grok: billing usage via ~/.grok/auth.json + cli-chat-proxy billing
++# Ollama Cloud: plan via POST https://ollama.com/api/me (API key) + usage via session-cookie scrape of https://ollama.com/settings
+ #
+ # Env:
+ #   AIQ_CLAUDE_ENABLED        "1" to fetch Claude (default: "1")
+@@ -22,10 +23,13 @@
+ #   AIQ_DEEPSEEK_ENABLED      "1" to fetch DeepSeek (default: "1")
+ #   AIQ_OPENROUTER_ENABLED    "1" to fetch OpenRouter (default: "1")
+ #   AIQ_GROK_ENABLED          "1" to fetch Grok (default: "1")
++#   AIQ_OLLAMA_ENABLED        "1" to fetch Ollama Cloud (default: "1")
+ #   DEEPSEEK_API_KEY          DeepSeek API key
+ #   OPENROUTER_API_KEY        OpenRouter API key (management key only if credits are denied)
+ #   OPENCODE_GO_API_KEY       OpenCode Go API key (overrides local auth.json)
+ #   OPENCODE_API_KEY          fallback OpenCode Go API key
++#   OLLAMA_API_KEY            Ollama Cloud API key (for plan lookup)
++#   OLLAMA_SESSION_COOKIE     Ollama Cloud __Secure-session cookie (for usage scrape)
+ #   AIQ_CACHE_TTL             seconds before cache is stale (default: 55)
+ #   AIQ_FORCE_REFRESH         "1" to bypass the cache
+ #   AIQ_USAGE_MOCK            file with sample JSON (for tests)
+@@ -39,6 +43,7 @@ or_enabled="${AIQ_OPENROUTER_ENABLED:-1}"
+ codex_enabled="${AIQ_CODEX_ENABLED:-1}"
+ agy_enabled="${AIQ_ANTIGRAVITY_ENABLED:-1}"
+ grok_enabled="${AIQ_GROK_ENABLED:-1}"
++ol_enabled="${AIQ_OLLAMA_ENABLED:-1}"
+ cache="${CACHE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/dms-ai-quotas/usage.json}"
+ ttl="${AIQ_CACHE_TTL:-55}"
+ force_refresh="${AIQ_FORCE_REFRESH:-0}"
+@@ -571,9 +576,9 @@ if [ "$agy_enabled" = "1" ]; then
+                 ACCOUNT=$(jq -r '.active // empty' "$HOME/.gemini/google_accounts.json" 2>/dev/null || true)
+ 
+             token_valid() {
+-                local exp="$1"
++                exp="$1"
+                 [ -z "$exp" ] && return 1
+-                local exp_epoch=0
++                exp_epoch=0
+                 case "$exp" in
+                     ''|*[!0-9]*)
+                         exp_epoch=$(date -d "$exp" +%s 2>/dev/null || echo 0) ;;
+@@ -693,6 +698,199 @@ if [ "$agy_enabled" = "1" ]; then
+     fi
+ fi
+ 
++# ============================================================
++# Ollama Cloud (plan via API key, usage via session-cookie scrape)
++# ============================================================
++ol_data='{"status":"unavailable"}'
++if [ "$ol_enabled" = "1" ]; then
++    ol_key="${OLLAMA_API_KEY:-}"
++    if [ -z "$ol_key" ]; then
++        ol_data_dir="${OPENCODE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
++        ol_key=$(jq -r '."ollama-cloud".key // empty' "$ol_data_dir/auth.json" 2>/dev/null)
++    fi
++    ol_key=$(printf '%s' "$ol_key" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
++
++    ol_cookie=""
++    ol_cookie_attempted=0
++    if [ -n "${OLLAMA_SESSION_COOKIE:-}" ]; then
++        ol_cookie=$(printf '%s' "$OLLAMA_SESSION_COOKIE" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
++        case "$ol_cookie" in
++            __Secure-session=*) ol_cookie="${ol_cookie#__Secure-session=}" ;;
++        esac
++        ol_cookie="${ol_cookie%%;*}"
++        ol_cookie=$(printf '%s' "$ol_cookie" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
++    fi
++    [ -n "$ol_cookie" ] && ol_cookie_attempted=1
++
++    ol_is_num() {
++        case "$1" in
++            ''|*[!0-9.]*) return 1 ;;
++            .*|*.) return 1 ;;
++            *.*.*) return 1 ;;
++        esac
++        return 0
++    }
++
++    ol_plan=""
++    ol_plan_ok=0
++    ol_key_reason=""
++    ol_key_err=""
++
++    # Plan via API key
++    if [ -n "$ol_key" ]; then
++        ol_plan_resp=$(curl -s -m 15 -w '\n%{http_code}' \
++            -X POST \
++            -H "Authorization: Bearer $ol_key" \
++            -H "Content-Type: application/json" \
++            https://ollama.com/api/me 2>/dev/null)
++        ol_plan_code=$(printf '%s\n' "$ol_plan_resp" | tail -n 1)
++        ol_plan_body=$(printf '%s\n' "$ol_plan_resp" | sed '$d')
++        case "$ol_plan_code" in
++            2??)
++                ol_plan=$(printf '%s' "$ol_plan_body" | jq -r '.Plan // empty' 2>/dev/null)
++                if [ -n "$ol_plan" ]; then
++                    ol_plan_ok=1
++                else
++                    ol_key_reason="parse_error"
++                    ol_key_err="Could not parse the Ollama Cloud plan from the API response."
++                fi
++                ;;
++            401)
++                ol_key_reason="auth_expired"
++                ol_key_err="Ollama Cloud rejected this API key. Check the key in plugin settings."
++                ;;
++            403)
++                ol_key_reason="access_denied"
++                ol_key_err="Ollama Cloud denied access for this API key."
++                ;;
++            429)
++                ol_key_reason="rate_limited"
++                ol_key_err="Ollama Cloud is temporarily rate limited. Try again shortly."
++                ;;
++            000)
++                ol_key_reason="network"
++                ol_key_err="Could not reach Ollama Cloud. Check your connection and try again."
++                ;;
++            *)
++                ol_key_reason="http_error"
++                ol_key_err="Ollama Cloud returned HTTP $ol_plan_code. Try again shortly."
++                ;;
++        esac
++    fi
++
++    # Usage via session-cookie scrape
++    ol_usage_ok=0
++    ol_usage_reason=""
++    ol_usage_err=""
++    ol_used=""
++    ol_limit=""
++    ol_reset_epoch=0
++    if [ "$ol_cookie_attempted" = "1" ]; then
++        ol_usage_resp=$(curl -s -m 20 -w '\n%{http_code}' \
++            -H "Cookie: __Secure-session=$ol_cookie" \
++            https://ollama.com/settings 2>/dev/null)
++        ol_usage_code=$(printf '%s\n' "$ol_usage_resp" | tail -n 1)
++        ol_usage_body=$(printf '%s\n' "$ol_usage_resp" | sed '$d')
++        case "$ol_usage_code" in
++            2??)
++                ol_meter=$(printf '%s' "$ol_usage_body" | grep -oE 'aria-label="Monthly usage[^"]*"' | sed -n '1p')
++                if [ -n "$ol_meter" ]; then
++                    ol_inner=$(printf '%s' "$ol_meter" | sed -E 's/^aria-label="Monthly usage[[:space:]]+//; s/[[:space:]]+used"$//')
++                    ol_used_raw=$(printf '%s' "$ol_inner" | sed -E 's/^[[:space:]]*\$//; s/[[:space:]]+of[[:space:]].*//' | tr -d ',')
++                    ol_limit_raw=$(printf '%s' "$ol_inner" | sed -E 's/.*[[:space:]]+of[[:space:]]+\$//' | tr -d ',')
++                    if ol_is_num "$ol_used_raw" && ol_is_num "$ol_limit_raw"; then
++                        ol_used="$ol_used_raw"
++                        ol_limit="$ol_limit_raw"
++                        ol_usage_ok=1
++                    fi
++                    ol_iso=$(printf '%s' "$ol_usage_body" | grep -oE 'data-time="[^"]*"' | sed -n '1p' | sed -E 's/^data-time="//; s/"$//')
++                    if [ -n "$ol_iso" ]; then
++                        ol_iso=$(printf '%s' "$ol_iso" | sed -E 's/\.[0-9]+//; s/\+00:00$/Z/')
++                        ol_reset_epoch=$(TZ=UTC jq -n --arg t "$ol_iso" '$t|fromdateiso8601' 2>/dev/null || true)
++                        case "$ol_reset_epoch" in ''|*[!0-9]*) ol_reset_epoch=0 ;; esac
++                    fi
++                fi
++                if [ "$ol_usage_ok" != "1" ]; then
++                    if printf '%s' "$ol_usage_body" | grep -qi 'Sign in'; then
++                        ol_usage_reason="auth_expired"
++                        ol_usage_err="Ollama Cloud session expired. Re-paste your session cookie in plugin settings."
++                    else
++                        ol_usage_reason="parse_error"
++                        ol_usage_err="Could not parse Ollama Cloud usage from the settings page."
++                    fi
++                fi
++                ;;
++            3??)
++                ol_usage_reason="auth_expired"
++                ol_usage_err="Ollama Cloud session expired. Re-paste your session cookie in plugin settings."
++                ;;
++            401)
++                ol_usage_reason="auth_expired"
++                ol_usage_err="Ollama Cloud session expired. Re-paste your session cookie in plugin settings."
++                ;;
++            403)
++                ol_usage_reason="access_denied"
++                ol_usage_err="Ollama Cloud denied access for this session cookie."
++                ;;
++            429)
++                ol_usage_reason="rate_limited"
++                ol_usage_err="Ollama Cloud is temporarily rate limited. Try again shortly."
++                ;;
++            000)
++                ol_usage_reason="network"
++                ol_usage_err="Could not reach Ollama Cloud. Check your connection and try again."
++                ;;
++            *)
++                ol_usage_reason="http_error"
++                ol_usage_err="Ollama Cloud returned HTTP $ol_usage_code. Try again shortly."
++                ;;
++        esac
++    fi
++
++    # Status precedence
++    if [ "$ol_usage_ok" = "1" ] && [ "$ol_plan_ok" = "1" ]; then
++        ol_data=$(jq -n -c \
++            --arg plan "$ol_plan" \
++            --arg used "$ol_used" \
++            --arg limit "$ol_limit" \
++            --argjson reset "$ol_reset_epoch" \
++            '{status:"ok", plan:$plan, used:($used|tonumber), limit:($limit|tonumber), currency:"USD", resetsAt:$reset}')
++    elif [ "$ol_usage_ok" = "1" ]; then
++        ol_data=$(jq -n -c \
++            --arg used "$ol_used" \
++            --arg limit "$ol_limit" \
++            --argjson reset "$ol_reset_epoch" \
++            '{status:"ok", used:($used|tonumber), limit:($limit|tonumber), currency:"USD", resetsAt:$reset}')
++    elif [ "$ol_plan_ok" = "1" ]; then
++        if [ "$ol_cookie_attempted" = "1" ]; then
++            ol_reason="$ol_usage_reason"
++            ol_err="$ol_usage_err"
++        else
++            ol_reason="usage_requires_cookie"
++            ol_err="Ollama usage requires a session cookie. Paste your __Secure-session cookie in plugin settings."
++        fi
++        ol_data=$(jq -n -c \
++            --arg plan "$ol_plan" \
++            --arg reason "$ol_reason" \
++            --arg err "$ol_err" \
++            '{status:"plan_only", plan:$plan, reason:$reason, error:$err}')
++    elif [ -z "$ol_key" ] && [ "$ol_cookie_attempted" = "0" ]; then
++        ol_data='{"status":"unavailable","reason":"not_configured","error":"Ollama Cloud is not configured. Set an API key or paste your session cookie in plugin settings."}'
++    else
++        if [ "$ol_cookie_attempted" = "1" ]; then
++            ol_reason="$ol_usage_reason"
++            ol_err="$ol_usage_err"
++        else
++            ol_reason="$ol_key_reason"
++            ol_err="$ol_key_err"
++        fi
++        ol_data=$(jq -n -c \
++            --arg reason "$ol_reason" \
++            --arg err "$ol_err" \
++            '{status:"error", reason:$reason, error:$err}')
++    fi
++fi
++
+ # ============================================================
+ # Merge and write cache
+ # ============================================================
+@@ -705,7 +903,8 @@ out=$(jq -c -n \
+     --argjson or "$or_data" \
+     --argjson grok "$grok_data" \
+     --argjson agy "$agy_data" \
+-    '{captured_at: $now, claude: $claude, codex: $codex, opencode: $oc, deepseek: $ds, openrouter: $or, grok: $grok, antigravity: $agy}') || exit 2
++    --argjson ol "$ol_data" \
++    '{captured_at: $now, claude: $claude, codex: $codex, opencode: $oc, deepseek: $ds, openrouter: $or, grok: $grok, antigravity: $agy, ollama: $ol}') || exit 2
+ 
+ tmp="$cache.tmp.$$"
+ printf '%s' "$out" > "$tmp" && mv -f "$tmp" "$cache"
+diff --git a/plugin.json b/plugin.json
+index f552aa9..f52b0ee 100644
+--- a/plugin.json
++++ b/plugin.json
+@@ -2,8 +2,8 @@
+   "$schema": "https://github.com/AvengeMedia/DankMaterialShell/raw/refs/heads/master/PLUGINS/plugin-schema.json",
+   "id": "aiQuotas",
+   "name": "AI Quotas",
+-  "description": "Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, and Grok usage limits and balances in your bar.",
+-  "version": "1.9.0",
++  "description": "Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, Ollama, and Grok usage limits and balances in your bar.",
++  "version": "1.10.0",
+   "author": "agneswd",
+   "license": "MIT",
+   "type": "composite",
+diff --git a/tests/fixtures/ollama-settings.html b/tests/fixtures/ollama-settings.html
+new file mode 100644
+index 0000000..3fde492
+--- /dev/null
++++ b/tests/fixtures/ollama-settings.html
+@@ -0,0 +1,887 @@
++
++
++
++
++
++
++
++
++
++
++
++<!doctype html>
++<html class="h-full overflow-y-scroll">
++  <head>
++    <title>Usage · Settings</title>
++
++    <meta charset="utf-8" />
++    <meta name="description" content="Get up and running with large language models."/>
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <meta property="og:title" content="Usage ·
++Settings" />
++    <meta property="og:description" content="Get up and running with large language models." />
++    <meta property="og:url" content="https://ollama.com/settings" />
++    <meta property="og:image" content="https://ollama.com/public/og.png" />
++    <meta property="og:image:type" content="image/png" />
++    <meta property="og:image:width" content="1200" />
++    <meta property="og:image:height" content="628" />
++    <meta property="og:type" content="website" />
++
++    <meta name="robots" content="index, follow" />
++
++    <meta property="twitter:card" content="summary" />
++    <meta property="twitter:title" content="Settings" />
++    <meta property="twitter:description" content="Get up and running with large language models." />
++    <meta property="twitter:site" content="ollama" />
++
++    <meta property="twitter:image:src" content="https://ollama.com/public/og-twitter.png" />
++    <meta property="twitter:image:width" content="1200" />
++    <meta property="twitter:image:height" content="628" />
++
++    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
++
++    <link rel="icon" type="image/png" sizes="16x16" href="/public/icon-16x16.png" />
++    <link rel="icon" type="image/png" sizes="32x32" href="/public/icon-32x32.png" />
++    <link rel="icon" type="image/png" sizes="48x48" href="/public/icon-48x48.png" />
++    <link rel="icon" type="image/png" sizes="64x64" href="/public/icon-64x64.png" />
++    <link rel="apple-touch-icon" sizes="180x180" href="/public/apple-touch-icon.png" />
++    <link rel="icon" type="image/png" sizes="192x192" href="/public/android-chrome-icon-192x192.png" />
++    <link rel="icon" type="image/png" sizes="512x512" href="/public/android-chrome-icon-512x512.png" />
++
++    
++    
++
++    <link href="/public/tailwind.css?v=e4ef9d2a017afb9ff3e485c641ba190b" rel="stylesheet" />
++    <link href="/public/vendor/prism/prism.css?v=e4ef9d2a017afb9ff3e485c641ba190b" rel="stylesheet" />
++    <script type="application/ld+json">
++      {
++        "@context": "https://schema.org",
++        "@type": "WebSite",
++        "name": "Ollama",
++        "url": "https://ollama.com"
++      }
++    </script>
++
++    <script type="text/javascript">
++      function copyToClipboard(element) {
++        let commandElement = null;
++        const preElement = element.closest('pre');
++        const languageNoneElement = element.closest('.language-none');
++
++        if (preElement) {
++          commandElement = preElement.querySelector('code');
++        } else if (languageNoneElement) {
++          commandElement = languageNoneElement.querySelector('.command');
++        } else {
++          const parent = element.parentElement;
++          if (parent) {
++            commandElement = parent.querySelector('.command');
++          }
++        }
++
++        if (!commandElement) {
++          console.error('No code or command element found');
++          return;
++        }
++
++        const code = commandElement.textContent ? commandElement.textContent.trim() : commandElement.value;
++
++        navigator.clipboard
++          .writeText(code)
++          .then(() => {
++            const copyIcon = element.querySelector('.copy-icon')
++            const checkIcon = element.querySelector('.check-icon')
++
++            copyIcon.classList.add('hidden')
++            checkIcon.classList.remove('hidden')
++
++            setTimeout(() => {
++              copyIcon.classList.remove('hidden')
++              checkIcon.classList.add('hidden')
++            }, 2000)
++          })
++      }
++    </script>
++    
++    <script>
++      
++      function getIcon(url) {
++        url = url.toLowerCase();
++        if (url.includes('x.com') || url.includes('twitter.com')) return 'x';
++        if (url.includes('github.com')) return 'github';
++        if (url.includes('linkedin.com')) return 'linkedin';
++        if (url.includes('youtube.com')) return 'youtube';
++        if (url.includes('hf.co') || url.includes('huggingface.co') || url.includes('huggingface.com')) return 'hugging-face';
++        return 'default';
++      }
++
++      function setInputIcon(input) {
++        const icon = getIcon(input.value);
++        const img = input.previousElementSibling.querySelector('img');
++        img.src = `/public/social/${icon}.svg`;
++        img.alt = `${icon} icon`;
++      }
++
++      function setDisplayIcon(imgElement, url) {
++        const icon = getIcon(url);
++        imgElement.src = `/public/social/${icon}.svg`;
++        imgElement.alt = `${icon} icon`;
++      }
++    </script>
++    
++    <script src="/public/vendor/htmx/bundle.js"></script>
++  </head>
++
++  <body
++    class="
++      antialiased
++      min-h-screen
++      w-full
++      m-0
++      flex
++      flex-col
++    "
++    hx-on:keydown="
++      if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
++        // Ignore key events in input fields.
++        return;
++      }
++      if ((event.metaKey && event.key === 'k') || event.key === '/') {
++        event.preventDefault();
++        const sp = htmx.find('#search') || htmx.find('#navbar-input');
++        if (sp) sp.focus();
++      }
++    "
++  >
++    
++        
++<header class="sticky top-0 z-40 bg-white underline-offset-4 lg:static">
++  <nav class="flex w-full items-center justify-between px-6 py-[9px]">
++    <a href="/" class="z-50">
++      <img src="/public/ollama.png" class="w-8" alt="Ollama" />
++    </a>
++    
++    
++    <div class="hidden lg:flex xl:flex-1 items-center space-x-6 ml-6 mr-6 xl:mr-0 text-lg">
++      <a class="hover:underline focus:underline focus:outline-none focus:ring-0" href="/search">Models</a>
++      <a class="hover:underline focus:underline focus:outline-none focus:ring-0" href="/docs">Docs</a>
++      <a class="hover:underline focus:underline focus:outline-none focus:ring-0" href="/pricing">Pricing</a>
++    </div>
++
++    
++    <div class="flex-grow justify-center items-center hidden lg:flex">
++      <div class="relative w-full xl:max-w-[28rem]">
++        
++<form action="/search" autocomplete="off">
++  <div 
++    class="relative flex w-full appearance-none bg-black/5 border border-neutral-100 items-center rounded-full"
++    hx-on:focusout="
++      if (!this.contains(event.relatedTarget)) {
++        const searchPreview = document.querySelector('#searchpreview');
++        if (searchPreview) {
++          htmx.addClass('#searchpreview', 'hidden');
++        }
++      }
++    "
++  >
++  <span id="searchIcon" class="pl-2 text-2xl text-neutral-500">
++    <svg class="mt-0.25 ml-1.5 h-5 w-5 fill-current" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
++      <path d="m8.5 3c3.0375661 0 5.5 2.46243388 5.5 5.5 0 1.24832096-.4158777 2.3995085-1.1166416 3.3225711l4.1469717 4.1470988c.2928932.2928932.2928932.767767 0 1.0606602-.2662666.2662665-.6829303.2904726-.9765418.0726181l-.0841184-.0726181-4.1470988-4.1469717c-.9230626.7007639-2.07425014 1.1166416-3.3225711 1.1166416-3.03756612 0-5.5-2.4624339-5.5-5.5 0-3.03756612 2.46243388-5.5 5.5-5.5zm0 1.5c-2.209139 0-4 1.790861-4 4s1.790861 4 4 4 4-1.790861 4-4-1.790861-4-4-4z" />
++    </svg>
++  </span>
++  <input
++    id="search"
++    hx-get="/search"
++    hx-trigger="keyup changed delay:100ms, focus"
++    hx-target="#searchpreview"
++    hx-swap="innerHTML"
++    name="q"
++    class="resize-none rounded-full border-0 py-2.5 bg-transparent text-sm w-full placeholder:text-neutral-500 focus:outline-none focus:ring-0"
++    placeholder="Search models"
++    autocomplete="off"
++    hx-on:keydown="
++      if (event.key === 'Enter') {
++        event.preventDefault();
++        window.location.href = '/search?q=' + encodeURIComponent(this.value);
++        return;
++      }
++      if (event.key === 'Escape') {
++        event.preventDefault();
++        this.value = '';
++        this.blur();
++        htmx.addClass('#searchpreview', 'hidden');
++        return;
++      }
++      if (event.key === 'Tab') { 
++        htmx.addClass('#searchpreview', 'hidden');
++        return;
++      }
++      if (event.key === 'ArrowDown') {
++        let first = document.querySelector('#search-preview-list a:first-of-type');
++        first?.focus();
++        event.preventDefault();
++      }
++      if (event.key === 'ArrowUp') {
++        let last = document.querySelector('#view-all-link');
++        last?.focus();
++        event.preventDefault();
++      }
++      htmx.removeClass('#searchpreview', 'hidden');
++    "
++    hx-on:focus="
++      htmx.removeClass('#searchpreview', 'hidden')
++    "
++  />
++</form>
++<div id="searchpreview" class="hidden absolute left-0 right-0 top-12 z-50" style="width: calc(100% + 2px); margin-left: -1px;"></div>
++</div>
++
++      </div>
++    </div>
++
++    
++    <div class="hidden lg:flex xl:flex-1 items-center space-x-2 justify-end ml-6 xl:ml-0">
++      
++      <div 
++        class="relative"
++        hx-on:focusout="
++        if (!this.contains(event.relatedTarget)) {
++          htmx.addClass('#user-nav', 'hidden');
++        }
++      ">
++        <div class="group relative">
++          <div class="flex items-center">
++            <button
++              type="menu"
++              hx-on:keydown="if (event.key === 'Escape') { htmx.addClass('#user-nav', 'hidden'); }"
++              hx-on:click="htmx.toggleClass('#user-nav', 'hidden')"
++              class="relative cursor-pointer group flex items-center rounded-full"
++            >
++              <img
++                id="headerProfileImg"
++                src="/public/assets/00000000-0000-1000-8000-000000000000.png"
++                alt="profile"
++                class="h-10 w-10 rounded-full border-[1.5px] border-neutral-100 object-cover hover:border-black"
++              />                
++              <div class="absolute bottom-0 right-0 z-10 h-4 w-4 bg-white rounded-full border-2 border-white flex items-center justify-center translate-x-1/4 translate-y-1/4 text-black">
++                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-8 h-8">
++                  <path
++                    fill-rule="evenodd"
++                    d="M12.53 16.28a.75.75 0 0 1-1.06 0l-7.5-7.5a.75.75 0 0 1 1.06-1.06L12 14.69l6.97-6.97a.75.75 0 1 1 1.06 1.06l-7.5 7.5Z"
++                    clip-rule="evenodd"
++                  />
++                </svg>
++              </div>
++            </button>
++          </div>
++          <nav id="user-nav" class="absolute hidden mt-2 right-0 w-52 rounded-2xl border border-neutral-200 bg-white shadow-xl shadow-black/5">
++            <div class="py-2">
++              <div class="flex flex-col px-4">
++                <div class="flex justify-between items-center gap-x-2 mb-1">
++                  <a href="/settings" class="font-medium text-xl hover:underline break-words focus:outline-none focus:ring-0 focus:underline truncate" >user</a>
++                </div>
++                
++                <div class="text-sm text-neutral-500 break-words">user@example.com</div>
++                
++              </div>
++              <div class="border-t border-neutral-200 my-2"></div>
++              <div class="space-y-2 px-4">
++                
++                <a href="/user" class="text-lg flex items-center whitespace-nowrap hover:underline focus:outline-none focus:ring-0 focus:underline">My models</a>
++                
++                <a href="/settings" class="text-lg flex items-center whitespace-nowrap hover:underline focus:outline-none focus:ring-0 focus:underline">Settings</a>
++                <a href="/download" class="text-lg flex items-center whitespace-nowrap hover:underline focus:outline-none focus:ring-0 focus:underline">Download</a>
++                <form action="/signout" method="post" hx-post="/signout">
++                  <input class="cursor-pointer hover:underline w-full text-left text-lg focus:outline-none focus:ring-0 focus:underline" type="submit" value="Sign out"/>
++                </form>
++              </div>
++            </div>
++          </nav>
++        </div>
++      </div>
++      
++    </div>
++    
++    
++    <div class="lg:hidden flex items-center">
++      <input type="checkbox" id="menu" class="peer hidden" />
++      <label for="menu" class="z-50 cursor-pointer peer-checked:hidden block">
++        <svg
++          class="h-8 w-8"
++          fill="none"
++          viewBox="0 0 24 24"
++          stroke-width="1.5"
++          stroke="currentColor"
++          aria-hidden="true"
++        >
++          <path
++            stroke-linecap="round"
++            stroke-linejoin="round"
++            d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"
++          />
++        </svg>
++      </label>
++      <label for="menu" class="z-50 cursor-pointer hidden peer-checked:block fixed top-4 right-6">
++        <svg
++          class="h-8 w-8"
++          fill="none"
++          viewBox="0 0 24 24"
++          stroke-width="1.5"
++          stroke="currentColor"
++          aria-hidden="true"
++        >
++          <path
++            stroke-linecap="round"
++            stroke-linejoin="round"
++            d="M6 18L18 6M6 6l12 12"
++          />
++        </svg>
++      </label>
++      
++      <div class="fixed inset-0 bg-white z-40 hidden peer-checked:block overflow-y-auto">
++        <div class="flex flex-col space-y-5 pt-[5.5rem] text-3xl">
++          
++          <div class="flex items-center space-x-4 px-6">
++            <img
++              id="headerProfileImg"
++              src="/public/assets/00000000-0000-1000-8000-000000000000.png"
++              alt="mobile profile"
++              class="h-12 w-12 rounded-full object-cover"
++            />
++            <div class="flex flex-col">
++              
++              <div class="hover:underline text-2xl font-medium">
++                <a href="/settings" >user</a>
++              </div>
++              <div class="text-base text-neutral-500">user@example.com</div>
++            </div>
++          </div>
++          <div class="border-t border-neutral-200"></div>
++          
++
++          
++          
++          <a class="px-6" href="/user">My models</a>
++          
++          <a class="px-6" href="/settings">Settings</a>
++          
++          
++          <a class="px-6" href="/search">Models</a>
++          <a class="px-6" href="/download">Download</a>
++          <a class="px-6" href="/docs">Docs</a>
++          <a class="px-6" href="/pricing">Pricing</a>
++
++          
++
++          
++          <a href="/signout" hx-post="/signout" class="block px-6">Sign out</a>
++          
++        </div>
++      </div>
++    </div>
++  </nav>
++</header>
++
++    
++
++    
++<div class="flex flex-1 justify-center">
++  <div class="mx-auto max-w-[50rem] w-full px-6 py-10 md:py-12 lg:px-8">
++    <div class="flex items-center lg:px-1 pb-5 md:pb-12">
++      <div class="flex flex-col truncate underline-offset-4 w-full">
++       <div class="space-x-2 items-center flex">
++          
++          <a id="settings-account-name" href="/user" class="font-medium text-lg hover:underline focus:outline-none focus:ring-0 focus:underline">
++            user
++          </a>
++          
++        </div>
++        <h2 id="header-email" class="text-neutral-800 text-sm truncate">
++          user@example.com
++        </h2>
++        
++      </div>
++    </div>
++
++    
++<section id="settings-sections" class="flex min-w-0 flex-col lg:flex-row lg:space-x-2">
++  <aside class="flex overflow-x-auto lg:px-1 lg:block lg:w-56 lg:flex-none">
++    <nav class="flex-none py-5 lg:py-1">
++      <ul role="list" class="flex gap-x-3 gap-y-1 whitespace-nowrap underline-offset-4 lg:flex-col">
++        <li>
++          <a href="/settings" class="flex gap-x-3 rounded-md py-2 lg:pt-0 text-base leading-6 hover:underline focus:outline-none focus:ring-0 focus:underline">
++            Usage
++          </a>
++        </li>
++        <li>
++          <a href="/settings/keys" class="flex gap-x-3 rounded-md py-2 text-base leading-6 hover:underline focus:outline-none focus:ring-0 focus:underline">
++            Keys
++          </a>
++        </li>
++        
++        
++        <li>
++          <a href="/settings/billing" class="flex gap-x-3 rounded-md py-2 text-base leading-6 hover:underline focus:outline-none focus:ring-0 focus:underline">
++            Billing
++          </a>
++        </li>
++        
++        
++        <li>
++          <a href="/settings/profile" class="flex gap-x-3 rounded-md py-2 text-base leading-6 hover:underline focus:outline-none focus:ring-0 focus:underline">
++            Profile
++          </a>
++        </li>
++        
++      </ul>
++    </nav>
++  </aside>
++
++  <div class="min-w-0 w-full">
++    
++<div class="flex min-w-0 max-w-full flex-col space-y-6">
++  
++  
++  <h2 class="text-xl font-medium flex items-center space-x-2">
++    <span>Included usage</span>
++    <span
++      class="text-xs font-normal px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-600 capitalize"
++      >pro</span
++    >
++  </h2>
++  
++  <p class="text-xs text-neutral-500 mb-4">
++    
++    Cloud models and capabilities such as web search draw from your monthly
++    included usage.
++    
++  </p>
++  
++  
++  
++  
++  <div>
++    <div class="flex justify-between mb-2">
++      <span class="text-sm">Monthly usage</span>
++      <span class="text-sm"
++        >$0 of $60 used</span
++      >
++    </div>
++    <div class="relative group" data-usage-meter>
++      <div
++        class="absolute bottom-6 left-[var(--usage-bubble-x,50%)] z-10 inline-flex max-w-[min(260px,100%)] -translate-x-1/2 flex-col items-start gap-0.5 rounded-xl border border-neutral-300 bg-white/95 px-2.5 pt-[7px] pb-2 text-neutral-900 opacity-0 pointer-events-none whitespace-nowrap backdrop-blur-md group-[.usage-meter--active]:opacity-100"
++        data-usage-bubble
++        aria-hidden="true"
++      >
++        <span class="max-w-[190px] overflow-hidden text-ellipsis text-xs font-medium leading-[1.2]" data-usage-model></span>
++        <span class="text-[11px] leading-[1.2] text-neutral-500" data-usage-requests></span>
++      </div>
++      <div
++        class="relative h-3 overflow-hidden rounded-full bg-neutral-200"
++        data-usage-track
++        aria-label="Monthly usage $12.34 of $60 used"
++      >
++        <div
++          class="flex h-full overflow-hidden bg-neutral-950"
++          style="width: 20.57%; "
++        >
++          
++          
++          
++        </div>
++      </div>
++    </div>
++    <div
++      class="text-xs text-neutral-500 mt-1 local-time"
++      data-time="2026-10-26T17:34:27Z"
++    >
++      Resets in 4 weeks.
++    </div>
++    
++    
++  </div>
++  
++
++  
++  <form method="POST" action="/settings" class="pt-2" hx-post="/settings" hx-swap="none">
++    <label class="flex items-center gap-2 text-xs text-neutral-700">
++      <input
++        type="checkbox"
++        name="notify-usage-limits"
++        class="rounded border-neutral-300"
++        onchange="this.form.requestSubmit()"
++        checked
++      />
++      <span>Notify me when I'm close to hitting my usage limits</span>
++    </label>
++  </form>
++  
++
++  
++
++  
++<div id="extra-usage" class="space-y-6 pt-4">
++  <style>
++    .extra-usage-dialog { width: calc(100% - 2rem); max-height: calc(100dvh - 2rem); overflow-y: auto; }
++    body:has(.extra-usage-dialog[open]) { overflow: hidden; }
++  </style>
++  <div class="space-y-1">
++    <h2 class="text-xl font-medium">Usage credits</h2>
++    <p class="text-xs text-neutral-500">
++      
++      Keep using cloud models after your plan's included usage runs out.
++      
++      
++    </p>
++  </div>
++
++  <div class="space-y-7">
++    <div class="flex items-center justify-between gap-4">
++      <div>
++        <div id="extra-usage-balance" class="text-lg font-medium leading-tight text-neutral-900">$0</div>
++        <div class="text-xs text-neutral-500">Current balance</div>
++        
++      </div>
++      
++      <button id="extra-usage-buy-more" type="button"  class="shrink-0 rounded-full border border-black bg-black px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-neutral-800 disabled:cursor-not-allowed disabled:border-neutral-200 disabled:bg-neutral-200 disabled:text-neutral-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black" aria-haspopup="dialog" aria-controls="extra-usage-purchase-dialog">Add more</button>
++      
++    </div>
++
++    
++    
++
++<div id="extra-usage-auto-reload" class="border-t border-neutral-200 pt-5">
++  
++  <div id="extra-usage-auto-reload-controls" class="flex items-center justify-between gap-4">
++    <div class="min-w-0">
++      <h3 class="text-sm font-medium text-neutral-900">Auto-reload</h3>
++      <p id="extra-usage-auto-reload-summary" class="mt-1 text-sm text-neutral-500">
++        Off
++      </p>
++    </div>
++    <button id="extra-usage-reload-toggle" type="button" role="switch" aria-label="Auto-reload" aria-checked="false"
++      onclick="document.getElementById('extra-usage-reload-dialog').showModal()" aria-haspopup="dialog" aria-controls="extra-usage-reload-dialog"
++      class="relative inline-flex h-6 w-10 shrink-0 items-center rounded-full p-1 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-black disabled:opacity-50 bg-neutral-200">
++      <span aria-hidden="true" class="inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform translate-x-0"></span>
++    </button>
++  </div>
++
++  <dialog id="extra-usage-reload-dialog" onclick="if (event.target === this) this.close()" aria-labelledby="extra-usage-reload-title" aria-describedby="extra-usage-reload-description" class="extra-usage-dialog !m-auto max-w-lg rounded-2xl border border-neutral-200 bg-white p-0 text-neutral-900 shadow-xl backdrop:bg-black/40">
++    
++    <div class="relative p-6 sm:p-8">
++      
++<button type="button" onclick="this.closest('dialog').close()" aria-label="Close" class="absolute right-4 top-4 rounded-full p-2 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-black">
++  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" d="m6 6 12 12M6 18 18 6" /></svg>
++</button>
++
++      <h2 id="extra-usage-reload-title" class="pr-8 text-xl font-semibold" tabindex="-1" autofocus>Adjust auto-reload</h2>
++      <p id="extra-usage-reload-description" class="mt-3 text-sm leading-6 text-neutral-600">Automatically add more usage credits when you’re running low.</p>
++
++      <form id="extra-usage-reload-form" method="POST" action="/settings/extra-usage/auto-reload" novalidate hx-post="/settings/extra-usage/auto-reload" hx-target="#extra-usage-auto-reload" hx-swap="outerHTML" hx-disabled-elt="#extra-usage-auto-reload button[type='submit']" hx-on::before-request="this.closest('dialog').close(); document.getElementById('extra-usage-reload-toggle').focus()" class="mt-6 space-y-5">
++        <input type="hidden" name="intent" value="save" />
++        
++        <div>
++          <label for="extra-usage-threshold" class="mb-2 block text-sm font-medium">When your balance falls below:</label>
++          <div class="relative">
++            <span class="pointer-events-none absolute left-3 top-2.5 text-neutral-500" aria-hidden="true">$</span>
++            <input id="extra-usage-threshold" type="number" name="threshold" min="0" max="10000" step="1" value="0" class="block w-full rounded-lg border border-neutral-200 bg-white py-2.5 pl-7 pr-3 text-base text-neutral-900 focus:border-black focus:outline-none focus:ring-1 focus:ring-black" />
++          </div>
++        </div>
++        <div>
++          <label for="extra-usage-reload-amount" class="mb-2 block text-sm font-medium">Reload amount:</label>
++          <div class="relative">
++            <span class="pointer-events-none absolute left-3 top-2.5 text-neutral-500" aria-hidden="true">$</span>
++            <input id="extra-usage-reload-amount" type="number" name="amount" min="5" max="10000" step="1" value="" placeholder="5" class="block w-full rounded-lg border border-neutral-200 bg-white py-2.5 pl-7 pr-3 text-base text-neutral-900 focus:border-black focus:outline-none focus:ring-1 focus:ring-black" />
++          </div>
++        </div>
++        <div>
++          <label for="extra-usage-monthly-limit" class="mb-2 block text-sm font-medium">Monthly max:</label>
++          <div class="relative">
++            <span class="pointer-events-none absolute left-3 top-2.5 text-neutral-500" aria-hidden="true">$</span>
++            <input id="extra-usage-monthly-limit" type="number" name="monthly_limit" min="5" max="10000" step="1" value="40" class="block w-full rounded-lg border border-neutral-200 bg-white py-2.5 pl-7 pr-3 text-base text-neutral-900 focus:border-black focus:outline-none focus:ring-1 focus:ring-black" />
++          </div>
++          <p id="extra-usage-monthly-spend" class="mt-1.5 text-xs text-neutral-500 empty:hidden"></p>
++        </div>
++        <p class="text-xs leading-5 text-neutral-500">We’ll charge your saved payment method for the reload amount whenever your balance falls below the threshold, up to your monthly max. You can turn off auto-reload at any time.</p>
++        <div class="flex justify-end gap-3 pt-1">
++          
++          <button type="button" onclick="this.closest('dialog').close()" class="rounded-full border border-neutral-200 bg-white px-4 py-2 text-sm font-medium shadow-sm hover:bg-neutral-50">Cancel</button>
++          
++          <button type="submit" class="rounded-full bg-black px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-50">Turn on</button>
++        </div>
++      </form>
++      
++    </div>
++
++  </dialog>
++  
++  
++</div>
++
++    
++
++    
++  </div>
++
++  
++  
++<p id="extra-usage-auto-reload-status"  class="text-sm empty:hidden text-red-600" role="alert"></p>
++
++  
++<dialog id="extra-usage-purchase-dialog" aria-labelledby="extra-usage-purchase-title" aria-describedby="extra-usage-purchase-description" class="extra-usage-dialog !m-auto max-w-xl rounded-2xl border border-neutral-200 bg-white p-0 text-neutral-900 shadow-xl backdrop:bg-black/40">
++  <div class="relative p-6 sm:p-8">
++    
++<button type="button" onclick="this.closest('dialog').close()" aria-label="Close" class="absolute right-4 top-4 rounded-full p-2 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-black">
++  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" d="m6 6 12 12M6 18 18 6" /></svg>
++</button>
++
++    <h2 id="extra-usage-purchase-title" class="pr-8 text-2xl font-semibold" tabindex="-1" autofocus>Add usage credits</h2>
++    <p id="extra-usage-purchase-description" class="mt-2 text-sm leading-6 text-neutral-600">Choose an amount to add, or select other for a custom amount.</p>
++    <form id="extra-usage-purchase" method="POST" action="/settings/extra-usage/checkout" class="mt-6 space-y-5">
++      <fieldset>
++        <legend class="sr-only">Amount to add</legend>
++        <div class="grid grid-cols-2 gap-2 sm:grid-cols-5">
++          
++          
++          <label class="cursor-pointer">
++            <input type="radio" name="dollars" value="5" class="peer sr-only" checked />
++            <span class="block rounded-xl border border-neutral-200 bg-white px-3 py-3 text-center text-base font-semibold hover:bg-neutral-50 peer-checked:border-neutral-400 peer-checked:bg-neutral-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-neutral-400">$5</span>
++          </label>
++          
++          <label class="cursor-pointer">
++            <input type="radio" name="dollars" value="20" class="peer sr-only"  />
++            <span class="block rounded-xl border border-neutral-200 bg-white px-3 py-3 text-center text-base font-semibold hover:bg-neutral-50 peer-checked:border-neutral-400 peer-checked:bg-neutral-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-neutral-400">$20</span>
++          </label>
++          
++          <label class="cursor-pointer">
++            <input type="radio" name="dollars" value="100" class="peer sr-only"  />
++            <span class="block rounded-xl border border-neutral-200 bg-white px-3 py-3 text-center text-base font-semibold hover:bg-neutral-50 peer-checked:border-neutral-400 peer-checked:bg-neutral-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-neutral-400">$100</span>
++          </label>
++          
++          <label class="cursor-pointer">
++            <input type="radio" name="dollars" value="500" class="peer sr-only"  />
++            <span class="block rounded-xl border border-neutral-200 bg-white px-3 py-3 text-center text-base font-semibold hover:bg-neutral-50 peer-checked:border-neutral-400 peer-checked:bg-neutral-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-neutral-400">$500</span>
++          </label>
++          
++          <label class="col-span-2 cursor-pointer sm:col-span-1">
++            <input type="radio" name="dollars" value="other" class="peer sr-only" />
++            <span class="block rounded-xl border border-neutral-200 bg-white px-3 py-3 text-center text-base font-semibold hover:bg-neutral-50 peer-checked:border-neutral-400 peer-checked:bg-neutral-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-neutral-400">Other</span>
++          </label>
++        </div>
++        <div id="extra-usage-custom" class="mt-4 hidden">
++          <label for="extra-usage-custom-amount" class="sr-only">Custom amount in dollars</label>
++          <div class="relative">
++            <span class="pointer-events-none absolute left-3 top-2.5 text-neutral-500" aria-hidden="true">$</span>
++            <input id="extra-usage-custom-amount" type="number" name="custom_dollars" min="5" max="10000" step="1" inputmode="numeric" placeholder="Enter amount" disabled class="block w-full rounded-lg border border-neutral-200 bg-white py-2.5 pl-7 pr-3 text-base focus:border-neutral-400 focus:outline-none focus:ring-2 focus:ring-neutral-100" />
++          </div>
++        </div>
++      </fieldset>
++      <div class="flex justify-end gap-3 pt-1">
++        <button type="button" onclick="this.closest('dialog').close()" class="rounded-full border border-neutral-200 bg-white px-4 py-2 text-sm font-medium hover:bg-neutral-50">Cancel</button>
++        <button type="submit" class="rounded-full bg-black px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800">Continue to checkout</button>
++      </div>
++    </form>
++  </div>
++</dialog>
++<script>
++  (function () {
++    const dialog = document.getElementById('extra-usage-purchase-dialog');
++    const form = document.getElementById('extra-usage-purchase');
++    const custom = document.getElementById('extra-usage-custom');
++    const input = document.getElementById('extra-usage-custom-amount');
++    document.getElementById('extra-usage-buy-more').addEventListener('click', () => dialog.showModal());
++    dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
++    function update() {
++      const selected = form.querySelector('input[name="dollars"]:checked');
++      const isOther = selected.value === 'other';
++      custom.classList.toggle('hidden', !isOther);
++      input.disabled = !isOther;
++      input.required = isOther;
++    }
++    form.addEventListener('change', event => {
++      update();
++      if (event.target.name === 'dollars' && event.target.value === 'other') input.focus();
++    });
++    update();
++  })();
++</script>
++
++  
++</div>
++
++
++  
++
++
++
++  
++
++  <script>
++    function applyLocalTimeTitles() {
++      document.querySelectorAll(".local-time").forEach(function (el) {
++        var iso = el.dataset.time;
++        if (iso) {
++          var d = new Date(iso);
++          el.title = d.toLocaleString(undefined, {
++            weekday: "short",
++            month: "short",
++            day: "numeric",
++            hour: "numeric",
++            minute: "2-digit",
++          });
++        }
++      });
++    }
++    applyLocalTimeTitles();
++    
++    
++    document.body.addEventListener("htmx:afterSwap", applyLocalTimeTitles);
++
++    document.querySelectorAll("[data-usage-meter]").forEach(function (meter) {
++      var bubble = meter.querySelector("[data-usage-bubble]");
++      var model = meter.querySelector("[data-usage-model]");
++      var requests = meter.querySelector("[data-usage-requests]");
++      var segments = meter.querySelectorAll("[data-usage-segment]");
++
++      if (!bubble || !model || !requests || segments.length === 0) {
++        return;
++      }
++
++      function requestLabel(count) {
++        return count === "1" ? "1 request" : count + " requests";
++      }
++
++      function placeBubble(segment) {
++        var meterRect = meter.getBoundingClientRect();
++        var segmentRect = segment.getBoundingClientRect();
++        var bubbleRect = bubble.getBoundingClientRect();
++        var center = segmentRect.left + segmentRect.width / 2 - meterRect.left;
++        var padding = 8;
++        var minX = bubbleRect.width / 2 + padding;
++        var maxX = meterRect.width - bubbleRect.width / 2 - padding;
++        var x =
++          maxX < minX
++            ? meterRect.width / 2
++            : Math.max(minX, Math.min(center, maxX));
++
++        meter.style.setProperty("--usage-bubble-x", x + "px");
++      }
++
++      function showSegment(segment) {
++        var count = segment.dataset.requests || "0";
++
++        model.textContent = segment.dataset.model || "";
++        requests.textContent = requestLabel(count);
++        segments.forEach(function (item) {
++          item.classList.remove("is-active");
++        });
++        segment.classList.add("is-active");
++        meter.classList.add("usage-meter--active");
++        requestAnimationFrame(function () {
++          placeBubble(segment);
++        });
++      }
++
++      function hideSegment() {
++        meter.classList.remove("usage-meter--active");
++        segments.forEach(function (item) {
++          item.classList.remove("is-active");
++        });
++      }
++
++      segments.forEach(function (segment) {
++        segment.addEventListener("pointerenter", function () {
++          showSegment(segment);
++        });
++        segment.addEventListener("pointermove", function () {
++          placeBubble(segment);
++        });
++        segment.addEventListener("focus", function () {
++          showSegment(segment);
++        });
++        segment.addEventListener("blur", hideSegment);
++      });
++
++      meter.addEventListener("pointerleave", hideSegment);
++    });
++  </script>
++
++  
++  </div>
++</section>
++
++  </div>
++</div>
++
++
++    
++      
++<footer class="mt-auto">
++
++  <div class="underline-offset-4 hidden md:block">
++    <div class="flex items-center justify-between px-6 py-3.5">
++      <div class="text-xs text-neutral-500">© 2026 Ollama</div>
++      <div class="flex space-x-6 text-xs text-neutral-500">
++        <a href="/download" class="hover:underline">Download</a>
++        <a href="/blog" class="hover:underline">Blog</a>
++        <a href="https://docs.ollama.com" class="hover:underline">Docs</a>
++        <a href="https://github.com/ollama/ollama" class="hover:underline">GitHub</a>
++        <a href="https://discord.com/invite/ollama" class="hover:underline">Discord</a>
++        <a href="https://twitter.com/ollama" class="hover:underline">X (Twitter)</a>
++        <a href="mailto:support@ollama.com" class="hover:underline">Support</a>
++        <a href="https://jobs.ashbyhq.com/ollama" class="hover:underline">Careers</a>
++        <a href="/privacy" class="hover:underline">Privacy</a>
++        <a href="/terms" class="hover:underline">Terms</a>
++      </div>
++    </div>
++  </div>
++  <div class="py-4 md:hidden">
++    <div class="flex flex-col items-center justify-center">
++      <ul class="flex flex-wrap items-center justify-center text-sm text-neutral-500">
++        <li class="mx-2 my-1">
++          <a href="/blog" class="hover:underline">Blog</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="/download" class="hover:underline">Download</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="https://docs.ollama.com" class="hover:underline">Docs</a>
++        </li>
++      </ul>
++      <ul class="flex flex-wrap items-center justify-center text-sm text-neutral-500">
++        <li class="mx-2 my-1">
++          <a href="https://github.com/ollama/ollama" class="hover:underline">GitHub</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="https://discord.com/invite/ollama" class="hover:underline">Discord</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="https://twitter.com/ollama" class="hover:underline">X (Twitter)</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="https://lu.ma/ollama" class="hover:underline">Meetups</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="https://jobs.ashbyhq.com/ollama" class="hover:underline">Careers</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="/privacy" class="hover:underline">Privacy</a>
++        </li>
++        <li class="mx-2 my-1">
++          <a href="/terms" class="hover:underline">Terms</a>
++        </li>
++      </ul>
++      <div class="mt-2 flex items-center justify-center text-sm text-neutral-500">
++        © 2026 Ollama Inc.
++      </div>
++    </div>
++  </div>
++
++</footer>
++
++    
++
++    
++    <span class="hidden" id="end_of_template"></span>
++  </body>
++</html>
+diff --git a/tests/test-cache.sh b/tests/test-cache.sh
+index 66b9472..b0b550d 100644
+--- a/tests/test-cache.sh
++++ b/tests/test-cache.sh
+@@ -16,6 +16,7 @@ run_fetch() {
+         AIQ_DEEPSEEK_ENABLED=0 \
+         AIQ_GROK_ENABLED=0 \
+         AIQ_ANTIGRAVITY_ENABLED=0 \
++        AIQ_OLLAMA_ENABLED=0 \
+         AIQ_FORCE_REFRESH="${1:-0}" \
+         CACHE_FILE="$cache" \
+         sh "$repo/fetch-usage.sh"
+diff --git a/tests/test-claude-native.sh b/tests/test-claude-native.sh
+index 80a8b77..e9615ba 100644
+--- a/tests/test-claude-native.sh
++++ b/tests/test-claude-native.sh
+@@ -50,6 +50,7 @@ run_fetch() {
+         AIQ_DEEPSEEK_ENABLED=0 \
+         AIQ_GROK_ENABLED=0 \
+         AIQ_ANTIGRAVITY_ENABLED=0 \
++        AIQ_OLLAMA_ENABLED=0 \
+         AIQ_CACHE_TTL=0 \
+         CLAUDE_CONFIG_DIR="$test_dir/claude" \
+         CLAUDE_USAGE_FILE="$test_dir/claude-usage.json" \
+diff --git a/tests/test-grok.sh b/tests/test-grok.sh
+index 00a27ee..163f3f6 100644
+--- a/tests/test-grok.sh
++++ b/tests/test-grok.sh
+@@ -21,6 +21,7 @@ env PATH="$test_dir/bin:$PATH" \
+     AIQ_DEEPSEEK_ENABLED=0 \
+     AIQ_GROK_ENABLED=1 \
+     AIQ_ANTIGRAVITY_ENABLED=0 \
++    AIQ_OLLAMA_ENABLED=0 \
+     AIQ_CACHE_TTL=0 \
+     GROK_HOME="$test_dir/grok" \
+     CACHE_FILE="$test_dir/usage.json" \
+@@ -37,6 +38,7 @@ env PATH="$test_dir/bin:$PATH" \
+     AIQ_DEEPSEEK_ENABLED=0 \
+     AIQ_GROK_ENABLED=1 \
+     AIQ_ANTIGRAVITY_ENABLED=0 \
++    AIQ_OLLAMA_ENABLED=0 \
+     AIQ_CACHE_TTL=0 \
+     GROK_HOME="$test_dir/grok" \
+     CACHE_FILE="$test_dir/usage.json" \
+@@ -53,6 +55,7 @@ env PATH="$test_dir/bin:$PATH" \
+     AIQ_DEEPSEEK_ENABLED=0 \
+     AIQ_GROK_ENABLED=1 \
+     AIQ_ANTIGRAVITY_ENABLED=0 \
++    AIQ_OLLAMA_ENABLED=0 \
+     AIQ_CACHE_TTL=0 \
+     GROK_HOME="$test_dir/grok" \
+     CACHE_FILE="$test_dir/usage.json" \
+diff --git a/tests/test-ollama-edge.sh b/tests/test-ollama-edge.sh
+new file mode 100644
+index 0000000..d47df4f
+--- /dev/null
++++ b/tests/test-ollama-edge.sh
+@@ -0,0 +1,199 @@
++#!/bin/sh
++set -eu
++
++repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
++test_dir=$(mktemp -d)
++trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
++mkdir -p "$test_dir/bin" "$test_dir/opencode"
++
++# Mock curl: routes by URL, counts invocations (optional), records argv (optional).
++cat > "$test_dir/bin/curl" <<'EOF'
++#!/bin/sh
++if [ -n "${CURL_COUNT_FILE:-}" ]; then
++    c=0
++    [ ! -f "$CURL_COUNT_FILE" ] || c=$(cat "$CURL_COUNT_FILE")
++    printf '%s\n' $((c + 1)) > "$CURL_COUNT_FILE"
++fi
++if [ -n "${RECORD_ARGV:-}" ]; then
++    printf '%s\n' "$*" >> "$RECORD_ARGV"
++fi
++url=""
++for a in "$@"; do
++    case "$a" in
++        https://*) url="$a" ;;
++    esac
++done
++case "$url" in
++    *ollama.com/api/me*)
++        printf '%s\n%s\n' "${PLAN_RESPONSE:-}" "${PLAN_CODE:-200}" ;;
++    *ollama.com/settings*)
++        printf '%s\n%s\n' "${USAGE_RESPONSE:-}" "${USAGE_CODE:-200}" ;;
++    *)
++        printf '%s\n%s\n' "" "000" ;;
++esac
++EOF
++chmod +x "$test_dir/bin/curl"
++
++fixture=$(cat "$repo/tests/fixtures/ollama-settings.html")
++
++run() {
++    env PATH="$test_dir/bin:$PATH" \
++        OLLAMA_API_KEY="${OLLAMA_API_KEY:-}" \
++        OLLAMA_SESSION_COOKIE="${OLLAMA_SESSION_COOKIE:-}" \
++        PLAN_RESPONSE="${PLAN_RESPONSE:-}" \
++        PLAN_CODE="${PLAN_CODE:-}" \
++        USAGE_RESPONSE="${USAGE_RESPONSE:-}" \
++        USAGE_CODE="${USAGE_CODE:-}" \
++        RECORD_ARGV="${RECORD_ARGV:-}" \
++        CURL_COUNT_FILE="${CURL_COUNT_FILE:-}" \
++        AIQ_CLAUDE_ENABLED=0 \
++        AIQ_CODEX_ENABLED=0 \
++        AIQ_OPENCODE_ENABLED=0 \
++        AIQ_DEEPSEEK_ENABLED=0 \
++        AIQ_OPENROUTER_ENABLED=0 \
++        AIQ_GROK_ENABLED=0 \
++        AIQ_ANTIGRAVITY_ENABLED=0 \
++        AIQ_OLLAMA_ENABLED="${AIQ_OLLAMA_ENABLED:-1}" \
++        OPENCODE_DATA_DIR="$test_dir/opencode" \
++        AIQ_CACHE_TTL="${AIQ_CACHE_TTL:-0}" \
++        CACHE_FILE="$test_dir/usage.json" \
++        sh "$repo/fetch-usage.sh"
++}
++
++fail() { echo "FAIL: $*" >&2; exit 1; }
++
++# 1. thousands separators in the meter -> used 1234.56, limit 5000
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=sess
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE='<html><body><div aria-label="Monthly usage $1,234.56 of $5,000 used"></div><div data-time="2026-10-26T17:34:27Z"></div></body></html>'
++USAGE_CODE=200
++run | jq -e \
++    '.ollama.status == "ok"
++     and .ollama.plan == "pro"
++     and .ollama.used == 1234.56
++     and .ollama.limit == 5000
++     and .ollama.currency == "USD"' >/dev/null \
++    || fail "thousands separators"
++
++# 2. meter present but data-time missing -> ok, resetsAt 0
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=sess
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE='<html><body><div aria-label="Monthly usage $12.34 of $60 used"></div></body></html>'
++USAGE_CODE=200
++run | jq -e \
++    '.ollama.status == "ok"
++     and .ollama.used == 12.34
++     and .ollama.limit == 60
++     and .ollama.resetsAt == 0' >/dev/null \
++    || fail "missing data-time -> resetsAt 0"
++
++# 3. cookie normalization: leading space, trailing newline, and a ';' suffix
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=$(printf ' __Secure-session=abc; other=1\n')
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++RECORD_ARGV="$test_dir/argv.log"
++run >/dev/null
++grep -Fq -- 'Cookie: __Secure-session=abc' "$test_dir/argv.log" \
++    || fail "cookie header not normalized to 'Cookie: __Secure-session=abc'"
++if grep -Fq 'other=1' "$test_dir/argv.log"; then
++    fail "cookie header leaked '; other=1' suffix"
++fi
++if grep -Fq 'abc; other=1' "$test_dir/argv.log"; then
++    fail "cookie header leaked raw 'abc; other=1'"
++fi
++
++# 4. cookie 403 + key ok -> plan_only, reason access_denied
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=sess
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE=''
++USAGE_CODE=403
++run | jq -e \
++    '.ollama.status == "plan_only"
++     and .ollama.plan == "pro"
++     and .ollama.reason == "access_denied"' >/dev/null \
++    || fail "cookie 403 + key ok -> plan_only access_denied"
++
++# 5. key HTTP 500 + cookie ok -> status ok (key failure ignored)
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=sess
++PLAN_RESPONSE=''
++PLAN_CODE=500
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++run | jq -e \
++    '.ollama.status == "ok"
++     and (.ollama.plan | not)
++     and .ollama.used == 12.34
++     and .ollama.limit == 60' >/dev/null \
++    || fail "key 500 + cookie ok -> status ok"
++
++# 6. AIQ_OLLAMA_ENABLED=0 -> unavailable (no reason), mock curl NOT called
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=sess
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++CURL_COUNT_FILE="$test_dir/count"
++printf '0\n' > "$CURL_COUNT_FILE"
++AIQ_OLLAMA_ENABLED=0
++run | jq -e \
++    '.ollama.status == "unavailable"
++     and (.ollama.reason | not)' >/dev/null \
++    || fail "disabled -> unavailable (no reason)"
++[ "$(cat "$CURL_COUNT_FILE")" = "0" ] || fail "disabled provider still called curl"
++
++# 7. cache hit: second run with TTL > 0 must not call curl again
++OLLAMA_API_KEY=sk-test
++OLLAMA_SESSION_COOKIE=sess
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++printf '0\n' > "$CURL_COUNT_FILE"
++AIQ_OLLAMA_ENABLED=1
++AIQ_CACHE_TTL=0
++run >/dev/null
++c1=$(cat "$CURL_COUNT_FILE")
++[ "$c1" = "2" ] || fail "expected 2 curl calls (plan + usage), got $c1"
++AIQ_CACHE_TTL=3600
++run >/dev/null
++c2=$(cat "$CURL_COUNT_FILE")
++[ "$c2" = "2" ] || fail "cache hit still called curl: $c1 -> $c2"
++
++# 8. secret leakage: failing scenario must not emit key or cookie markers
++OLLAMA_API_KEY='SEKRIT-KEY-42'
++OLLAMA_SESSION_COOKIE='__Secure-session=SEKRIT-COOKIE-42'
++PLAN_RESPONSE=''
++PLAN_CODE=401
++USAGE_RESPONSE=''
++USAGE_CODE=403
++AIQ_OLLAMA_ENABLED=1
++AIQ_CACHE_TTL=0
++run > "$test_dir/out.json" 2> "$test_dir/err.txt"
++if grep -Fq 'SEKRIT-KEY-42' "$test_dir/out.json"; then
++    fail "key leaked into stdout JSON"
++fi
++if grep -Fq 'SEKRIT-COOKIE-42' "$test_dir/out.json"; then
++    fail "cookie leaked into stdout JSON"
++fi
++if grep -Fq 'SEKRIT-KEY-42' "$test_dir/err.txt"; then
++    fail "key leaked into stderr"
++fi
++if grep -Fq 'SEKRIT-COOKIE-42' "$test_dir/err.txt"; then
++    fail "cookie leaked into stderr"
++fi
++if grep -Fq 'SEKRIT' "$test_dir/usage.json"; then
++    fail "secret leaked into cache file"
++fi
++
++printf '%s\n' "all ollama edge cases passed"
+diff --git a/tests/test-ollama.sh b/tests/test-ollama.sh
+new file mode 100644
+index 0000000..a85e950
+--- /dev/null
++++ b/tests/test-ollama.sh
+@@ -0,0 +1,266 @@
++#!/bin/sh
++set -eu
++
++repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
++test_dir=$(mktemp -d)
++trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
++mkdir -p "$test_dir/bin" "$test_dir/opencode"
++
++# Route mock curl by URL so plan (/api/me) and usage (/settings) are independent.
++cat > "$test_dir/bin/curl" <<'EOF'
++#!/bin/sh
++url=""
++for a in "$@"; do
++    case "$a" in
++        https://*) url="$a" ;;
++    esac
++done
++if [ -n "${RECORD_ARGV:-}" ]; then
++    printf '%s\n' "$*" >> "$RECORD_ARGV"
++fi
++case "$url" in
++    *ollama.com/api/me*)
++        printf '%s\n%s\n' "$PLAN_RESPONSE" "${PLAN_CODE:-200}" ;;
++    *ollama.com/settings*)
++        printf '%s\n%s\n' "$USAGE_RESPONSE" "${USAGE_CODE:-200}" ;;
++    *)
++        printf '%s\n%s\n' "" "000" ;;
++esac
++EOF
++chmod +x "$test_dir/bin/curl"
++
++fixture=$(cat "$repo/tests/fixtures/ollama-settings.html")
++expected_reset=$(TZ=UTC jq -n '"2026-10-26T17:34:27Z"|fromdateiso8601')
++
++run() {
++    env PATH="$test_dir/bin:$PATH" \
++        OLLAMA_API_KEY="${OLLAMA_API_KEY:-}" \
++        OLLAMA_SESSION_COOKIE="${OLLAMA_SESSION_COOKIE:-}" \
++        PLAN_RESPONSE="${PLAN_RESPONSE:-}" \
++        PLAN_CODE="${PLAN_CODE:-}" \
++        USAGE_RESPONSE="${USAGE_RESPONSE:-}" \
++        USAGE_CODE="${USAGE_CODE:-}" \
++        RECORD_ARGV="${RECORD_ARGV:-}" \
++        AIQ_CLAUDE_ENABLED=0 \
++        AIQ_CODEX_ENABLED=0 \
++        AIQ_OPENCODE_ENABLED=0 \
++        AIQ_DEEPSEEK_ENABLED=0 \
++        AIQ_OPENROUTER_ENABLED=0 \
++        AIQ_GROK_ENABLED=0 \
++        AIQ_ANTIGRAVITY_ENABLED=0 \
++        AIQ_OLLAMA_ENABLED=1 \
++        OPENCODE_DATA_DIR="$test_dir/opencode" \
++        AIQ_CACHE_TTL=0 \
++        CACHE_FILE="$test_dir/usage.json" \
++        sh "$repo/fetch-usage.sh"
++}
++
++# 1. fixture + key ok -> status ok, used 12.34, limit 60, plan "pro", resetsAt epoch
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++run | jq -e --argjson er "$expected_reset" \
++    '.ollama.status == "ok"
++     and .ollama.plan == "pro"
++     and .ollama.used == 12.34
++     and .ollama.limit == 60
++     and .ollama.currency == "USD"
++     and .ollama.resetsAt == $er' \
++    >/dev/null
++
++# 2. fixture, no key -> ok, no plan
++OLLAMA_API_KEY=
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE=
++PLAN_CODE=
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++run | jq -e --argjson er "$expected_reset" \
++    '.ollama.status == "ok"
++     and (.ollama.plan | not)
++     and .ollama.used == 12.34
++     and .ollama.limit == 60
++     and .ollama.resetsAt == $er' \
++    >/dev/null
++
++# 3. no cookie, key ok -> plan_only, plan "pro"
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE=
++USAGE_CODE=
++run | jq -e \
++    '.ollama.status == "plan_only"
++     and .ollama.plan == "pro"
++     and .ollama.reason == "usage_requires_cookie"' \
++    >/dev/null
++
++# 4. no cookie, no key, empty auth dir -> unavailable / not_configured
++OLLAMA_API_KEY=
++OLLAMA_SESSION_COOKIE=
++PLAN_RESPONSE=
++PLAN_CODE=
++USAGE_RESPONSE=
++USAGE_CODE=
++run | jq -e \
++    '.ollama.status == "unavailable"
++     and .ollama.reason == "not_configured"' \
++    >/dev/null
++
++# 5. cookie returns sign-in page (no meter, contains "Sign in"), key ok -> plan_only, reason auth_expired
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE='<html><body>Sign in to continue</body></html>'
++USAGE_CODE=200
++run | jq -e \
++    '.ollama.status == "plan_only"
++     and .ollama.plan == "pro"
++     and .ollama.reason == "auth_expired"' \
++    >/dev/null
++
++# 6. cookie 302, no key -> error, reason auth_expired
++OLLAMA_API_KEY=
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE=
++PLAN_CODE=
++USAGE_RESPONSE=''
++USAGE_CODE=302
++run | jq -e \
++    '.ollama.status == "error"
++     and .ollama.reason == "auth_expired"' \
++    >/dev/null
++
++# 7. cookie 429, key ok -> plan_only, reason rate_limited
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE=''
++USAGE_CODE=429
++run | jq -e \
++    '.ollama.status == "plan_only"
++     and .ollama.plan == "pro"
++     and .ollama.reason == "rate_limited"' \
++    >/dev/null
++
++# 8. fixture + key 401 -> ok, no plan
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE=''
++PLAN_CODE=401
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++run | jq -e --argjson er "$expected_reset" \
++    '.ollama.status == "ok"
++     and (.ollama.plan | not)
++     and .ollama.used == 12.34
++     and .ollama.limit == 60
++     and .ollama.resetsAt == $er' \
++    >/dev/null
++
++# 9. both 000 -> error, reason network
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE=''
++PLAN_CODE=000
++USAGE_RESPONSE=''
++USAGE_CODE=000
++run | jq -e \
++    '.ollama.status == "error"
++     and .ollama.reason == "network"' \
++    >/dev/null
++
++# 10. malformed HTML (no meter, no sign-in), no key -> error, reason parse_error
++OLLAMA_API_KEY=
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE=
++PLAN_CODE=
++USAGE_RESPONSE='<html><body>Welcome to settings</body></html>'
++USAGE_CODE=200
++run | jq -e \
++    '.ollama.status == "error"
++     and .ollama.reason == "parse_error"' \
++    >/dev/null
++
++# 11. header check: cookie input "__Secure-session=abc; x=1" -> mock sees "Cookie: __Secure-session=abc"
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE='__Secure-session=abc; x=1'
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++RECORD_ARGV="$test_dir/argv.log"
++run >/dev/null
++grep -q 'Cookie: __Secure-session=abc' "$test_dir/argv.log"
++if grep -q 'x=1' "$test_dir/argv.log"; then
++    echo "FAIL: cookie header leaked '; x=1' suffix" >&2
++    exit 1
++fi
++
++# 12. key with trailing CRLF + spaces -> Authorization header trimmed, no CRLF
++OLLAMA_API_KEY=$(printf '  sk-ollama-test\r\n  ')
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE="$fixture"
++USAGE_CODE=200
++RECORD_ARGV="$test_dir/argv-key.log"
++run >/dev/null
++grep -Fq -- 'Authorization: Bearer sk-ollama-test' "$test_dir/argv-key.log"
++if grep -Fq "$(printf '\r')" "$test_dir/argv-key.log"; then
++    echo "FAIL: CR leaked into request headers" >&2
++    exit 1
++fi
++if [ "$(wc -l < "$test_dir/argv-key.log")" != "2" ]; then
++    echo "FAIL: newline leaked into request headers" >&2
++    exit 1
++fi
++
++# 13. data-time with fractional seconds -> same epoch as non-fractional value
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE='<html><body><div aria-label="Monthly usage $12.34 of $60 used"></div><div data-time="2026-10-26T17:34:27.123Z"></div></body></html>'
++USAGE_CODE=200
++run | jq -e --argjson er "$expected_reset" \
++    '.ollama.status == "ok"
++     and .ollama.used == 12.34
++     and .ollama.limit == 60
++     and .ollama.resetsAt == $er' \
++    >/dev/null
++
++# 14. data-time with +00:00 offset -> same epoch
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE='<html><body><div aria-label="Monthly usage $12.34 of $60 used"></div><div data-time="2026-10-26T17:34:27+00:00"></div></body></html>'
++USAGE_CODE=200
++run | jq -e --argjson er "$expected_reset" \
++    '.ollama.status == "ok"
++     and .ollama.used == 12.34
++     and .ollama.limit == 60
++     and .ollama.resetsAt == $er' \
++    >/dev/null
++
++# 15. aria-label with double spaces -> used 12.34, limit 60
++OLLAMA_API_KEY=sk-ollama-test
++OLLAMA_SESSION_COOKIE=session-abc
++PLAN_RESPONSE='{"Plan":"pro"}'
++PLAN_CODE=200
++USAGE_RESPONSE='<html><body><div aria-label="Monthly usage  $12.34  of  $60  used"></div><div data-time="2026-10-26T17:34:27Z"></div></body></html>'
++USAGE_CODE=200
++run | jq -e \
++    '.ollama.status == "ok"
++     and .ollama.used == 12.34
++     and .ollama.limit == 60' \
++    >/dev/null
++
++printf '%s\n' "all ollama cases passed"
+diff --git a/tests/test-opencode.sh b/tests/test-opencode.sh
+index 5014bbc..0ba6e8e 100755
+--- a/tests/test-opencode.sh
++++ b/tests/test-opencode.sh
+@@ -30,6 +30,7 @@ run_fetch() {
+         AIQ_OPENROUTER_ENABLED=0 \
+         AIQ_GROK_ENABLED=0 \
+         AIQ_ANTIGRAVITY_ENABLED=0 \
++        AIQ_OLLAMA_ENABLED=0 \
+         OPENCODE_GO_API_KEY="${OPENCODE_GO_API_KEY-sk-test}" \
+         OPENCODE_DATA_DIR="$test_dir/opencode" \
+         AIQ_CACHE_TTL=0 \
+diff --git a/tests/test-openrouter.sh b/tests/test-openrouter.sh
+index 64ed405..dff84f8 100755
+--- a/tests/test-openrouter.sh
++++ b/tests/test-openrouter.sh
+@@ -28,6 +28,7 @@ run_fetch() {
+         AIQ_OPENROUTER_ENABLED=1 \
+         AIQ_GROK_ENABLED=0 \
+         AIQ_ANTIGRAVITY_ENABLED=0 \
++        AIQ_OLLAMA_ENABLED=0 \
+         OPENROUTER_API_KEY=sk-or-test \
+         AIQ_CACHE_TTL=0 \
+         CACHE_FILE="$test_dir/usage.json" \
+-- 
+2.55.0
+

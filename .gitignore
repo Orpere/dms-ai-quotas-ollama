@@ -1,0 +1,18 @@
+# Local secrets and state — never commit
+.env
+.env.*
+*.key
+plugin_settings.json
+*_state.json
+*.bak
+*.bak-*
+*.new
+*.tmp
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
+
+# Build / test scratch
+/coverage/
