@@ -16,6 +16,7 @@ run_fetch() {
         AIQ_DEEPSEEK_ENABLED=0 \
         AIQ_GROK_ENABLED=0 \
         AIQ_ANTIGRAVITY_ENABLED=0 \
+        AIQ_OLLAMA_ENABLED=0 \
         AIQ_FORCE_REFRESH="${1:-0}" \
         CACHE_FILE="$cache" \
         sh "$repo/fetch-usage.sh"

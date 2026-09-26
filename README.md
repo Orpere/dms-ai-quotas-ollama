@@ -1,6 +1,13 @@
 # dms-ai-quotas
 
-Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, and Grok usage limits and balances in your [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar.
+Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, Ollama, and Grok usage limits and balances in your [DankMaterialShell](https://github.com/AvengeMedia/DankMaterialShell) bar.
+
+> **About this repository.** Community fork of
+> [agneswd/dms-ai-quotas](https://github.com/agneswd/dms-ai-quotas) that adds an
+> **Ollama Cloud** provider (plan + monthly included usage). It is based on upstream
+> `main` at `222184e`. See [INSTALL.md](INSTALL.md) for fresh-install and patching
+> instructions, [SECURITY.md](SECURITY.md) for credential handling, and
+> [CHANGELOG.md](CHANGELOG.md) for what changed.
 
 <p align="center">
   <img src="assets/screenshot.png" alt="AI Quotas popout" width="500"/>
@@ -16,26 +23,28 @@ Monitor Claude, Codex, OpenCode, Antigravity, DeepSeek, OpenRouter, and Grok usa
 | **Antigravity** | Agent/model usage quotas | Claude, Gemini Pro, Gemini Flash, Gemini Image usage % and reset times |
 | **DeepSeek API** | Account balance | Available total, API availability, unexpired grants, and paid top-ups |
 | **OpenRouter** | Account credit balance | Remaining credits, purchased total, and usage |
+| **Ollama Cloud** | Plan + monthly included usage | Plan name and `$used of $limit` monthly included usage with reset time |
 | **Grok** | Usage limits | Shared weekly usage % with reset countdown, from local `grok login` |
 
 The plugin is designed to be extensible - additional AI coding providers can be added in the future.
 
 ## Features
 
-- Merged bar pill showing provider logos, pinned percentages, and DeepSeek and OpenRouter balances
+- Merged bar pill showing provider logos, pinned percentages, and DeepSeek, OpenRouter, and Ollama Cloud balances
 - Claude, Codex, OpenCode, and Grok pinned percentages in the bar pill, with all supported limits in the popout
 - Separators between provider sections in the pill
 - Click to open a tabbed provider popout with clean per-limit detail cards
-- Pin any Claude, Codex, OpenCode, DeepSeek, or Grok item directly from its popout card
+- Pin any Claude, Codex, OpenCode, DeepSeek, OpenRouter, Ollama Cloud, or Grok item directly from its popout card
 - Display mode toggle: show remaining % or used % (synced between pill and popout)
 - Reset date/time or countdown shown for each usage limit
 - DeepSeek API balance card with availability status, total, unexpired grants, paid top-ups, and logo
 - OpenRouter credit balance card with remaining, purchased, and used amounts, and logo
+- Ollama Cloud plan card with plan badge, monthly included usage bar, and reset time
 - Grok usage card from local `grok login` (no API key)
 - Configurable refresh interval (30s - 300s)
 - Toggle each provider on/off independently
 - OpenCode Rolling (5h), Weekly, and Monthly windows are always available in the popout
-- Claude, Codex, OpenCode, and Grok use local CLI logins. DeepSeek and OpenRouter keys are set in DMS settings.
+- Claude, Codex, OpenCode, and Grok use local CLI logins. DeepSeek and OpenRouter keys are set in DMS settings. Ollama Cloud optionally uses an API key (plan name) and a session cookie (monthly usage).
 
 ## Requirements
 
@@ -44,6 +53,8 @@ The plugin is designed to be extensible - additional AI coding providers can be 
 - For Claude: Claude Code 2.1.220 or newer, installed and signed in (`claude`)
 - For DeepSeek: an API key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
 - For OpenRouter: an API key from [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys). If credit access is denied, create a management key at [openrouter.ai/settings/management-keys](https://openrouter.ai/settings/management-keys)
+- For Ollama: an API key from [ollama.com/settings/keys](https://ollama.com/settings/keys) to show your plan name
+- For Ollama usage: a session cookie from [ollama.com](https://ollama.com) (the `__Secure-session` cookie value) — grants full account access, keep it private
 - For Grok: the Grok CLI installed and authenticated with `grok login`
 - For Codex: the Codex CLI installed and authenticated with `codex login`
 - For OpenCode: the OpenCode CLI connected with `/connect` to OpenCode Go, or an API key from [opencode.ai](https://opencode.ai)
@@ -75,6 +86,7 @@ Then in DMS:
 | Antigravity | on | Show Antigravity agent and model quotas |
 | DeepSeek | on | Show DeepSeek account balance |
 | OpenRouter | on | Show OpenRouter credit balance |
+| Ollama Cloud | on | Show your Ollama Cloud plan and monthly included usage |
 | Grok | on | Show usage limits from the local Grok login |
 | Refresh Interval | 60s | How often to fetch data (30-300s) |
 | Show Reset Times | on | Show reset information in the popout |
@@ -92,6 +104,8 @@ Claude, Codex, OpenCode, and Grok use their local CLI logins automatically. Sign
 | DeepSeek API Key | Your DeepSeek API key from platform.deepseek.com/api_keys |
 | OpenRouter API Key | Your OpenRouter API key from openrouter.ai/settings/keys |
 | OpenCode Go API Key | Optional. Leave empty to use `~/.local/share/opencode/auth.json` |
+| Ollama Cloud API Key | Optional. Create a key at ollama.com/settings/keys. Shows your plan name |
+| Ollama Cloud Session Cookie | Optional. Paste the `__Secure-session` cookie value from your browser after signing in at ollama.com to show monthly usage. Grants full account access - keep it private |
 
 ### Enable Claude quota capture
 

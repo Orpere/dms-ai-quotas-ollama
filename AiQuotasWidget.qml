@@ -17,6 +17,9 @@ PluginComponent {
     property bool grokEnabled: pluginData.grokEnabled !== false
     property string deepSeekApiKey: pluginData.deepSeekApiKey || ""
     property string openRouterApiKey: pluginData.openRouterApiKey || ""
+    property bool ollamaEnabled: pluginData.ollamaEnabled !== false
+    property string ollamaApiKey: pluginData.ollamaApiKey || ""
+    property string ollamaSessionCookie: pluginData.ollamaSessionCookie || ""
     property string displayMode: pluginData.displayMode || "remaining"
     property bool showResetTime: pluginData.showResetTime !== false
     property bool showResetCountdown: pluginData.showResetCountdown === true
@@ -79,11 +82,11 @@ PluginComponent {
         }
     }
 
-    readonly property var providerIds: ["claude", "codex", "opencode", "deepseek", "openrouter", "grok", "antigravity"]
+    readonly property var providerIds: ["claude", "codex", "opencode", "deepseek", "openrouter", "ollama", "grok", "antigravity"]
 
     function defaultPinState() {
         var openCodePin = savedSetting("pinnedWindow", "Rolling") || "Rolling"
-        return { claude: ["5h"], codex: ["5h"], opencode: [openCodePin], deepseek: ["balance"], openrouter: ["balance"], grok: ["Billing"], antigravity: ["Gemini Models - Five Hour Limit Remaining"] }
+        return { claude: ["5h"], codex: ["5h"], opencode: [openCodePin], deepseek: ["balance"], openrouter: ["balance"], ollama: ["usage"], grok: ["Billing"], antigravity: ["Gemini Models - Five Hour Limit Remaining"] }
     }
 
     function savedSetting(key, fallback) {
@@ -156,6 +159,7 @@ PluginComponent {
     function pinnedAntigravityEntries() { return pinnedEntries("antigravity", antigravityEntries()) }
     function deepSeekPinned() { return isPinned("deepseek", "balance") }
     function openRouterPinned() { return isPinned("openrouter", "balance") }
+    function ollamaPinned() { return isPinned("ollama", "usage") }
 
     function providerEnabled(provider) {
         if (provider === "claude") return claudeEnabled
@@ -163,6 +167,7 @@ PluginComponent {
         if (provider === "opencode") return openCodeEnabled
         if (provider === "deepseek") return deepSeekEnabled
         if (provider === "openrouter") return openRouterEnabled
+        if (provider === "ollama") return ollamaEnabled
         if (provider === "grok") return grokEnabled
         if (provider === "antigravity") return antigravityEnabled
         return false
@@ -175,6 +180,7 @@ PluginComponent {
         if (openCodeEnabled) out.push({ id: "opencode", label: "OpenCode", icon: "assets/opencode-logo.svg" })
         if (deepSeekEnabled) out.push({ id: "deepseek", label: "DeepSeek", icon: "assets/deepseek-logo.svg" })
         if (openRouterEnabled) out.push({ id: "openrouter", label: "OpenRouter", icon: "assets/openrouter-logo.svg" })
+        if (ollamaEnabled) out.push({ id: "ollama", label: "Ollama Cloud", icon: "assets/ollama-logo.svg" })
         if (grokEnabled) out.push({ id: "grok", label: "Grok", icon: "assets/grok-logo.svg" })
         if (antigravityEnabled) out.push({ id: "antigravity", label: "Antigravity", icon: "assets/antigravity-logo.svg" })
         return out
@@ -248,6 +254,40 @@ PluginComponent {
 
     function hasOpenRouter() {
         return openRouterEnabled && openRouterPinned() && orBalance() != null
+    }
+
+    function ollamaUsage() {
+        try {
+            if (!usageData || !usageData.ollama) return null
+            if (usageData.ollama.status !== "ok") return null
+            return usageData.ollama
+        } catch (e) { return null }
+    }
+
+    function ollamaPlan() {
+        try {
+            if (!usageData || !usageData.ollama) return ""
+            var st = usageData.ollama.status
+            if (st !== "ok" && st !== "plan_only") return ""
+            var plan = usageData.ollama.plan
+            if (!plan) return ""
+            return plan.charAt(0).toUpperCase() + plan.slice(1)
+        } catch (e) { return "" }
+    }
+
+    function hasOllama() {
+        return ollamaEnabled && ollamaPinned() && ollamaUsage() != null
+    }
+
+    function ollamaUsedPct() {
+        try {
+            var u = ollamaUsage()
+            if (!u) return 0
+            var used = parseFloat(u.used)
+            var limit = parseFloat(u.limit)
+            if (!isFinite(used) || !isFinite(limit) || limit <= 0) return 0
+            return Math.max(0, Math.min(100, used / limit * 100))
+        } catch (e) { return 0 }
     }
 
     function grokEntries() {
@@ -390,6 +430,16 @@ PluginComponent {
         } catch (e) { return "--" }
     }
 
+    function fmtUsd(value) {
+        try {
+            var amount = parseFloat(value)
+            if (!isFinite(amount)) return "--"
+            var s = (Math.round(amount * 100) % 100 === 0)
+                ? amount.toFixed(0) : amount.toFixed(2)
+            return "$" + s
+        } catch (e) { return "--" }
+    }
+
     function pctStr(pct) {
         try {
             if (pct < 0) return "--"
@@ -457,7 +507,7 @@ PluginComponent {
 
                 // Separator after Claude
                 Rectangle {
-                    visible: root.pinnedClaudeEntries().length > 0 && (root.pinnedCodexEntries().length > 0 || root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                    visible: root.pinnedClaudeEntries().length > 0 && (root.pinnedCodexEntries().length > 0 || root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
                     width: 1
                     height: pill.height - 8
                     color: Theme.outlineVariant
@@ -489,7 +539,7 @@ PluginComponent {
 
                 // Separator after Codex
                 Rectangle {
-                    visible: root.pinnedCodexEntries().length > 0 && (root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                    visible: root.pinnedCodexEntries().length > 0 && (root.pinnedOpenCodeEntries().length > 0 || root.hasDeepSeek() || root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
                     width: 1
                     height: pill.height - 8
                     color: Theme.outlineVariant
@@ -521,7 +571,7 @@ PluginComponent {
 
                 // Separator after OpenCode
                 Rectangle {
-                    visible: root.pinnedOpenCodeEntries().length > 0 && (root.hasDeepSeek() || root.hasOpenRouter() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                    visible: root.pinnedOpenCodeEntries().length > 0 && (root.hasDeepSeek() || root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
                     width: 1
                     height: pill.height - 8
                     color: Theme.outlineVariant
@@ -553,7 +603,7 @@ PluginComponent {
 
                 // Separator after DeepSeek
                 Rectangle {
-                    visible: root.hasDeepSeek() && (root.hasOpenRouter() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                    visible: root.hasDeepSeek() && (root.hasOpenRouter() || root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
                     width: 1
                     height: pill.height - 8
                     color: Theme.outlineVariant
@@ -585,7 +635,42 @@ PluginComponent {
 
                 // Separator after OpenRouter
                 Rectangle {
-                    visible: root.hasOpenRouter() && (root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                    visible: root.hasOpenRouter() && (root.hasOllama() || root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
+                    width: 1
+                    height: pill.height - 8
+                    color: Theme.outlineVariant
+                    opacity: 0.4
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+
+                // Ollama usage
+                Repeater {
+                    model: root.hasOllama() ? [1] : []
+                    delegate: Row {
+                        spacing: 4
+                        Image {
+                            source: root.pluginDir + "assets/ollama-logo.svg"
+                            sourceSize.width: 14
+                            sourceSize.height: 14
+                            width: 14; height: 14
+                            fillMode: Image.PreserveAspectFit
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        StyledText {
+                            text: {
+                                var u = root.ollamaUsage()
+                                return u ? root.fmtUsd(u.used) + "/" + root.fmtUsd(u.limit) : "--"
+                            }
+                            color: Theme.surfaceText
+                            font.pixelSize: Theme.fontSizeMedium
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+                }
+
+                // Separator after Ollama
+                Rectangle {
+                    visible: root.hasOllama() && (root.pinnedGrokEntries().length > 0 || root.pinnedAntigravityEntries().length > 0)
                     width: 1
                     height: pill.height - 8
                     color: Theme.outlineVariant
@@ -775,6 +860,30 @@ PluginComponent {
                             text: {
                                 var b = root.orBalance()
                                 return b ? (parseFloat(b.total) || 0).toFixed(0) : "--"
+                            }
+                            color: Theme.surfaceText
+                            font.pixelSize: Theme.fontSizeSmall
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+                    }
+                }
+
+                Repeater {
+                    model: root.hasOllama() ? [1] : []
+                    delegate: Column {
+                        spacing: 1
+                        Image {
+                            source: root.pluginDir + "assets/ollama-logo.svg"
+                            sourceSize.width: 14
+                            sourceSize.height: 14
+                            width: 14; height: 14
+                            fillMode: Image.PreserveAspectFit
+                            anchors.horizontalCenter: parent.horizontalCenter
+                        }
+                        StyledText {
+                            text: {
+                                var u = root.ollamaUsage()
+                                return u ? root.fmtUsd(u.used) : "--"
                             }
                             color: Theme.surfaceText
                             font.pixelSize: Theme.fontSizeSmall
@@ -1654,6 +1763,160 @@ PluginComponent {
                                     if (o && o.error) return o.error
                                     if (root.openRouterApiKey.length === 0) return "Set OpenRouter API key in plugin settings."
                                     return "No OpenRouter balance data."
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Ollama card ---
+                    StyledRect {
+                        visible: root.selectedProvider === "ollama" && root.ollamaEnabled
+                        width: parent.width
+                        height: ollamaCard.implicitHeight + Theme.spacingM * 2
+                        radius: Theme.cornerRadius
+                        color: Theme.surfaceContainerHigh
+
+                        Column {
+                            id: ollamaCard
+                            anchors.fill: parent
+                            anchors.margins: Theme.spacingM
+                            spacing: Theme.spacingS
+
+                            Row {
+                                width: parent.width
+                                spacing: Theme.spacingS
+
+                                StyledText {
+                                    text: "Ollama Cloud"
+                                    color: Theme.surfaceVariantText
+                                    font.pixelSize: Theme.fontSizeSmall
+                                    font.weight: Font.Bold
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+
+                                Rectangle {
+                                    visible: root.ollamaPlan() !== ""
+                                    height: 18
+                                    width: ollamaPlanBadgeText.implicitWidth + 16
+                                    radius: 9
+                                    color: Theme.surfaceSelected
+                                    border.color: Theme.outlineVariant
+                                    border.width: 1
+                                    anchors.verticalCenter: parent.verticalCenter
+
+                                    StyledText {
+                                        id: ollamaPlanBadgeText
+                                        anchors.centerIn: parent
+                                        text: root.ollamaPlan() + " plan"
+                                        color: Theme.primary
+                                        font.pixelSize: Theme.fontSizeSmall
+                                        font.weight: Font.Bold
+                                    }
+                                }
+                            }
+
+                            // Ollama monthly usage
+                            Repeater {
+                                model: root.ollamaUsage() ? [root.ollamaUsage()] : []
+                                delegate: Column {
+                                    width: parent.width
+                                    spacing: Theme.spacingS
+                                    Row {
+                                        width: parent.width
+                                        spacing: Theme.spacingM
+                                        Image {
+                                            source: root.pluginDir + "assets/ollama-logo.svg"
+                                            sourceSize.width: 28
+                                            sourceSize.height: 28
+                                            width: 28; height: 28
+                                            fillMode: Image.PreserveAspectFit
+                                            anchors.verticalCenter: parent.verticalCenter
+                                        }
+                                        Column {
+                                            width: parent.width - 40 - 28 - Theme.spacingM
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            spacing: 2
+                                            StyledText {
+                                                text: "Monthly included usage"
+                                                color: Theme.surfaceVariantText
+                                                font.pixelSize: Theme.fontSizeSmall
+                                            }
+                                            StyledText {
+                                                text: root.fmtUsd(modelData.used) + " of " + root.fmtUsd(modelData.limit) + " used"
+                                                color: Theme.surfaceText
+                                                font.pixelSize: Theme.fontSizeLarge
+                                                font.weight: Font.Bold
+                                            }
+                                        }
+                                        Rectangle {
+                                            width: 28; height: 28; radius: 14
+                                            color: root.isPinned("ollama", "usage")
+                                                ? Theme.surfaceSelected
+                                                : (ollamaPinArea.containsMouse ? Theme.surfaceHover : Theme.surfaceContainerHighest)
+                                            border.color: root.isPinned("ollama", "usage")
+                                                ? Theme.outlineMedium : Theme.outlineVariant
+                                            border.width: 1
+                                            anchors.verticalCenter: parent.verticalCenter
+
+                                            MouseArea {
+                                                id: ollamaPinArea
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.togglePin("ollama", "usage")
+                                            }
+
+                                            DankIcon {
+                                                anchors.centerIn: parent
+                                                name: "push_pin"
+                                                size: 17
+                                                color: root.isPinned("ollama", "usage")
+                                                    ? Theme.primary : Theme.surfaceVariantText
+                                                rotation: root.isPinned("ollama", "usage") ? 0 : 45
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        id: ollamaProgressTrack
+                                        width: parent.width
+                                        height: 8
+                                        radius: 4
+                                        color: Theme.outlineVariant
+                                        Rectangle {
+                                            width: ollamaProgressTrack.width * root.ollamaUsedPct() / 100
+                                            height: parent.height
+                                            radius: parent.radius
+                                            color: root.ollamaUsedPct() >= 90 ? Theme.error : Theme.primary
+                                        }
+                                    }
+                                    StyledText {
+                                        visible: root.showResetTime && modelData.resetsAt > 0
+                                        text: root.resetLabel(modelData.resetsAt)
+                                        color: Theme.surfaceVariantText
+                                        font.pixelSize: Theme.fontSizeSmall
+                                    }
+                                }
+                            }
+
+                            // Ollama plan_only / unavailable / error / loading
+                            StyledText {
+                                visible: root.ollamaUsage() == null
+                                width: parent.width
+                                wrapMode: Text.WordWrap
+                                color: {
+                                    var o = root.usageData && root.usageData.ollama
+                                    return o && (o.reason === "auth_expired" || o.reason === "access_denied")
+                                        ? Theme.warning : Theme.surfaceVariantText
+                                }
+                                font.pixelSize: Theme.fontSizeSmall
+                                text: {
+                                    if (!root.usageData) return "Loading..."
+                                    var o = root.usageData.ollama
+                                    if (!o) return "No Ollama Cloud data."
+                                    if (o.status === "plan_only") return o.error || "Add a session cookie in plugin settings to see monthly usage."
+                                    if (o.status === "unavailable") return "Ollama Cloud is not configured. Add an API key or session cookie in plugin settings."
+                                    if (o.status === "error") return o.error || "Could not load Ollama Cloud data."
+                                    return "No Ollama Cloud data."
                                 }
                             }
                         }

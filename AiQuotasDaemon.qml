@@ -16,9 +16,12 @@ PluginComponent {
     property bool openRouterEnabled: pluginData.openRouterEnabled !== false
     property bool antigravityEnabled: pluginData.antigravityEnabled !== false
     property bool grokEnabled: pluginData.grokEnabled !== false
+    property bool ollamaEnabled: pluginData.ollamaEnabled !== false
     property string deepSeekApiKey: pluginData.deepSeekApiKey || ""
     property string openRouterApiKey: pluginData.openRouterApiKey || ""
     property string openCodeApiKey: pluginData.openCodeApiKey || ""
+    property string ollamaApiKey: pluginData.ollamaApiKey || ""
+    property string ollamaSessionCookie: pluginData.ollamaSessionCookie || ""
     property string pluginDir: {
         var url = Qt.resolvedUrl(".")
         var path = url.toString()
@@ -52,10 +55,13 @@ PluginComponent {
             "AIQ_OPENROUTER_ENABLED=" + (root.openRouterEnabled ? "1" : "0"),
             "AIQ_GROK_ENABLED=" + (root.grokEnabled ? "1" : "0"),
             "AIQ_ANTIGRAVITY_ENABLED=" + (root.antigravityEnabled ? "1" : "0"),
+            "AIQ_OLLAMA_ENABLED=" + (root.ollamaEnabled ? "1" : "0"),
             "AIQ_FORCE_REFRESH=" + (root.activeForce ? "1" : "0"),
             "DEEPSEEK_API_KEY=" + root.deepSeekApiKey,
             "OPENROUTER_API_KEY=" + root.openRouterApiKey,
             "OPENCODE_GO_API_KEY=" + root.openCodeApiKey,
+            "OLLAMA_API_KEY=" + root.ollamaApiKey,
+            "OLLAMA_SESSION_COOKIE=" + root.ollamaSessionCookie,
             "sh", root.pluginDir + "fetch-usage.sh"
         ]
         stdout: SplitParser {
@@ -81,8 +87,9 @@ PluginComponent {
 
     function fetchSignature() {
         return [claudeEnabled, codexEnabled, openCodeEnabled, deepSeekEnabled,
-            openRouterEnabled, antigravityEnabled, grokEnabled, deepSeekApiKey,
-            openRouterApiKey, openCodeApiKey].join("\u001f")
+            openRouterEnabled, antigravityEnabled, grokEnabled, ollamaEnabled,
+            deepSeekApiKey, openRouterApiKey, openCodeApiKey, ollamaApiKey,
+            ollamaSessionCookie].join("\u001f")
     }
 
     function requestFetch(force) {

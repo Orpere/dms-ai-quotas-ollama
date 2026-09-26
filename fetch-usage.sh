@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fetch Claude, Codex and OpenCode Go usage plus DeepSeek, OpenRouter and Grok balances, merge, cache, and print.
+# Fetch Claude, Codex and OpenCode Go usage plus DeepSeek, OpenRouter, Grok and Ollama Cloud balances, merge, cache, and print.
 #
 # Claude: reads native rate-limit data captured from Claude Code's status line
 # Codex: GET https://chatgpt.com/backend-api/wham/usage using the local Codex login
@@ -7,6 +7,7 @@
 # DeepSeek: GET https://api.deepseek.com/user/balance
 # OpenRouter: GET https://openrouter.ai/api/v1/credits
 # Grok: billing usage via ~/.grok/auth.json + cli-chat-proxy billing
+# Ollama Cloud: plan via POST https://ollama.com/api/me (API key) + usage via session-cookie scrape of https://ollama.com/settings
 #
 # Env:
 #   AIQ_CLAUDE_ENABLED        "1" to fetch Claude (default: "1")
@@ -22,10 +23,13 @@
 #   AIQ_DEEPSEEK_ENABLED      "1" to fetch DeepSeek (default: "1")
 #   AIQ_OPENROUTER_ENABLED    "1" to fetch OpenRouter (default: "1")
 #   AIQ_GROK_ENABLED          "1" to fetch Grok (default: "1")
+#   AIQ_OLLAMA_ENABLED        "1" to fetch Ollama Cloud (default: "1")
 #   DEEPSEEK_API_KEY          DeepSeek API key
 #   OPENROUTER_API_KEY        OpenRouter API key (management key only if credits are denied)
 #   OPENCODE_GO_API_KEY       OpenCode Go API key (overrides local auth.json)
 #   OPENCODE_API_KEY          fallback OpenCode Go API key
+#   OLLAMA_API_KEY            Ollama Cloud API key (for plan lookup)
+#   OLLAMA_SESSION_COOKIE     Ollama Cloud __Secure-session cookie (for usage scrape)
 #   AIQ_CACHE_TTL             seconds before cache is stale (default: 55)
 #   AIQ_FORCE_REFRESH         "1" to bypass the cache
 #   AIQ_USAGE_MOCK            file with sample JSON (for tests)
@@ -39,6 +43,7 @@ or_enabled="${AIQ_OPENROUTER_ENABLED:-1}"
 codex_enabled="${AIQ_CODEX_ENABLED:-1}"
 agy_enabled="${AIQ_ANTIGRAVITY_ENABLED:-1}"
 grok_enabled="${AIQ_GROK_ENABLED:-1}"
+ol_enabled="${AIQ_OLLAMA_ENABLED:-1}"
 cache="${CACHE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/dms-ai-quotas/usage.json}"
 ttl="${AIQ_CACHE_TTL:-55}"
 force_refresh="${AIQ_FORCE_REFRESH:-0}"
@@ -571,9 +576,9 @@ if [ "$agy_enabled" = "1" ]; then
                 ACCOUNT=$(jq -r '.active // empty' "$HOME/.gemini/google_accounts.json" 2>/dev/null || true)
 
             token_valid() {
-                local exp="$1"
+                exp="$1"
                 [ -z "$exp" ] && return 1
-                local exp_epoch=0
+                exp_epoch=0
                 case "$exp" in
                     ''|*[!0-9]*)
                         exp_epoch=$(date -d "$exp" +%s 2>/dev/null || echo 0) ;;
@@ -694,6 +699,199 @@ if [ "$agy_enabled" = "1" ]; then
 fi
 
 # ============================================================
+# Ollama Cloud (plan via API key, usage via session-cookie scrape)
+# ============================================================
+ol_data='{"status":"unavailable"}'
+if [ "$ol_enabled" = "1" ]; then
+    ol_key="${OLLAMA_API_KEY:-}"
+    if [ -z "$ol_key" ]; then
+        ol_data_dir="${OPENCODE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode}"
+        ol_key=$(jq -r '."ollama-cloud".key // empty' "$ol_data_dir/auth.json" 2>/dev/null)
+    fi
+    ol_key=$(printf '%s' "$ol_key" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+
+    ol_cookie=""
+    ol_cookie_attempted=0
+    if [ -n "${OLLAMA_SESSION_COOKIE:-}" ]; then
+        ol_cookie=$(printf '%s' "$OLLAMA_SESSION_COOKIE" | tr -d '\r\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        case "$ol_cookie" in
+            __Secure-session=*) ol_cookie="${ol_cookie#__Secure-session=}" ;;
+        esac
+        ol_cookie="${ol_cookie%%;*}"
+        ol_cookie=$(printf '%s' "$ol_cookie" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    fi
+    [ -n "$ol_cookie" ] && ol_cookie_attempted=1
+
+    ol_is_num() {
+        case "$1" in
+            ''|*[!0-9.]*) return 1 ;;
+            .*|*.) return 1 ;;
+            *.*.*) return 1 ;;
+        esac
+        return 0
+    }
+
+    ol_plan=""
+    ol_plan_ok=0
+    ol_key_reason=""
+    ol_key_err=""
+
+    # Plan via API key
+    if [ -n "$ol_key" ]; then
+        ol_plan_resp=$(curl -s -m 15 -w '\n%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer $ol_key" \
+            -H "Content-Type: application/json" \
+            https://ollama.com/api/me 2>/dev/null)
+        ol_plan_code=$(printf '%s\n' "$ol_plan_resp" | tail -n 1)
+        ol_plan_body=$(printf '%s\n' "$ol_plan_resp" | sed '$d')
+        case "$ol_plan_code" in
+            2??)
+                ol_plan=$(printf '%s' "$ol_plan_body" | jq -r '.Plan // empty' 2>/dev/null)
+                if [ -n "$ol_plan" ]; then
+                    ol_plan_ok=1
+                else
+                    ol_key_reason="parse_error"
+                    ol_key_err="Could not parse the Ollama Cloud plan from the API response."
+                fi
+                ;;
+            401)
+                ol_key_reason="auth_expired"
+                ol_key_err="Ollama Cloud rejected this API key. Check the key in plugin settings."
+                ;;
+            403)
+                ol_key_reason="access_denied"
+                ol_key_err="Ollama Cloud denied access for this API key."
+                ;;
+            429)
+                ol_key_reason="rate_limited"
+                ol_key_err="Ollama Cloud is temporarily rate limited. Try again shortly."
+                ;;
+            000)
+                ol_key_reason="network"
+                ol_key_err="Could not reach Ollama Cloud. Check your connection and try again."
+                ;;
+            *)
+                ol_key_reason="http_error"
+                ol_key_err="Ollama Cloud returned HTTP $ol_plan_code. Try again shortly."
+                ;;
+        esac
+    fi
+
+    # Usage via session-cookie scrape
+    ol_usage_ok=0
+    ol_usage_reason=""
+    ol_usage_err=""
+    ol_used=""
+    ol_limit=""
+    ol_reset_epoch=0
+    if [ "$ol_cookie_attempted" = "1" ]; then
+        ol_usage_resp=$(curl -s -m 20 -w '\n%{http_code}' \
+            -H "Cookie: __Secure-session=$ol_cookie" \
+            https://ollama.com/settings 2>/dev/null)
+        ol_usage_code=$(printf '%s\n' "$ol_usage_resp" | tail -n 1)
+        ol_usage_body=$(printf '%s\n' "$ol_usage_resp" | sed '$d')
+        case "$ol_usage_code" in
+            2??)
+                ol_meter=$(printf '%s' "$ol_usage_body" | grep -oE 'aria-label="Monthly usage[^"]*"' | sed -n '1p')
+                if [ -n "$ol_meter" ]; then
+                    ol_inner=$(printf '%s' "$ol_meter" | sed -E 's/^aria-label="Monthly usage[[:space:]]+//; s/[[:space:]]+used"$//')
+                    ol_used_raw=$(printf '%s' "$ol_inner" | sed -E 's/^[[:space:]]*\$//; s/[[:space:]]+of[[:space:]].*//' | tr -d ',')
+                    ol_limit_raw=$(printf '%s' "$ol_inner" | sed -E 's/.*[[:space:]]+of[[:space:]]+\$//' | tr -d ',')
+                    if ol_is_num "$ol_used_raw" && ol_is_num "$ol_limit_raw"; then
+                        ol_used="$ol_used_raw"
+                        ol_limit="$ol_limit_raw"
+                        ol_usage_ok=1
+                    fi
+                    ol_iso=$(printf '%s' "$ol_usage_body" | grep -oE 'data-time="[^"]*"' | sed -n '1p' | sed -E 's/^data-time="//; s/"$//')
+                    if [ -n "$ol_iso" ]; then
+                        ol_iso=$(printf '%s' "$ol_iso" | sed -E 's/\.[0-9]+//; s/\+00:00$/Z/')
+                        ol_reset_epoch=$(TZ=UTC jq -n --arg t "$ol_iso" '$t|fromdateiso8601' 2>/dev/null || true)
+                        case "$ol_reset_epoch" in ''|*[!0-9]*) ol_reset_epoch=0 ;; esac
+                    fi
+                fi
+                if [ "$ol_usage_ok" != "1" ]; then
+                    if printf '%s' "$ol_usage_body" | grep -qi 'Sign in'; then
+                        ol_usage_reason="auth_expired"
+                        ol_usage_err="Ollama Cloud session expired. Re-paste your session cookie in plugin settings."
+                    else
+                        ol_usage_reason="parse_error"
+                        ol_usage_err="Could not parse Ollama Cloud usage from the settings page."
+                    fi
+                fi
+                ;;
+            3??)
+                ol_usage_reason="auth_expired"
+                ol_usage_err="Ollama Cloud session expired. Re-paste your session cookie in plugin settings."
+                ;;
+            401)
+                ol_usage_reason="auth_expired"
+                ol_usage_err="Ollama Cloud session expired. Re-paste your session cookie in plugin settings."
+                ;;
+            403)
+                ol_usage_reason="access_denied"
+                ol_usage_err="Ollama Cloud denied access for this session cookie."
+                ;;
+            429)
+                ol_usage_reason="rate_limited"
+                ol_usage_err="Ollama Cloud is temporarily rate limited. Try again shortly."
+                ;;
+            000)
+                ol_usage_reason="network"
+                ol_usage_err="Could not reach Ollama Cloud. Check your connection and try again."
+                ;;
+            *)
+                ol_usage_reason="http_error"
+                ol_usage_err="Ollama Cloud returned HTTP $ol_usage_code. Try again shortly."
+                ;;
+        esac
+    fi
+
+    # Status precedence
+    if [ "$ol_usage_ok" = "1" ] && [ "$ol_plan_ok" = "1" ]; then
+        ol_data=$(jq -n -c \
+            --arg plan "$ol_plan" \
+            --arg used "$ol_used" \
+            --arg limit "$ol_limit" \
+            --argjson reset "$ol_reset_epoch" \
+            '{status:"ok", plan:$plan, used:($used|tonumber), limit:($limit|tonumber), currency:"USD", resetsAt:$reset}')
+    elif [ "$ol_usage_ok" = "1" ]; then
+        ol_data=$(jq -n -c \
+            --arg used "$ol_used" \
+            --arg limit "$ol_limit" \
+            --argjson reset "$ol_reset_epoch" \
+            '{status:"ok", used:($used|tonumber), limit:($limit|tonumber), currency:"USD", resetsAt:$reset}')
+    elif [ "$ol_plan_ok" = "1" ]; then
+        if [ "$ol_cookie_attempted" = "1" ]; then
+            ol_reason="$ol_usage_reason"
+            ol_err="$ol_usage_err"
+        else
+            ol_reason="usage_requires_cookie"
+            ol_err="Ollama usage requires a session cookie. Paste your __Secure-session cookie in plugin settings."
+        fi
+        ol_data=$(jq -n -c \
+            --arg plan "$ol_plan" \
+            --arg reason "$ol_reason" \
+            --arg err "$ol_err" \
+            '{status:"plan_only", plan:$plan, reason:$reason, error:$err}')
+    elif [ -z "$ol_key" ] && [ "$ol_cookie_attempted" = "0" ]; then
+        ol_data='{"status":"unavailable","reason":"not_configured","error":"Ollama Cloud is not configured. Set an API key or paste your session cookie in plugin settings."}'
+    else
+        if [ "$ol_cookie_attempted" = "1" ]; then
+            ol_reason="$ol_usage_reason"
+            ol_err="$ol_usage_err"
+        else
+            ol_reason="$ol_key_reason"
+            ol_err="$ol_key_err"
+        fi
+        ol_data=$(jq -n -c \
+            --arg reason "$ol_reason" \
+            --arg err "$ol_err" \
+            '{status:"error", reason:$reason, error:$err}')
+    fi
+fi
+
+# ============================================================
 # Merge and write cache
 # ============================================================
 out=$(jq -c -n \
@@ -705,7 +903,8 @@ out=$(jq -c -n \
     --argjson or "$or_data" \
     --argjson grok "$grok_data" \
     --argjson agy "$agy_data" \
-    '{captured_at: $now, claude: $claude, codex: $codex, opencode: $oc, deepseek: $ds, openrouter: $or, grok: $grok, antigravity: $agy}') || exit 2
+    --argjson ol "$ol_data" \
+    '{captured_at: $now, claude: $claude, codex: $codex, opencode: $oc, deepseek: $ds, openrouter: $or, grok: $grok, antigravity: $agy, ollama: $ol}') || exit 2
 
 tmp="$cache.tmp.$$"
 printf '%s' "$out" > "$tmp" && mv -f "$tmp" "$cache"

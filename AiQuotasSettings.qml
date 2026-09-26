@@ -11,13 +11,14 @@ PluginSettings {
         SectionTitle {
             text: I18n.tr("Providers")
             icon: "smart_toy"
-            showReset: claudeEnabled.isDirty || codexEnabled.isDirty || openCodeEnabled.isDirty || deepSeekEnabled.isDirty || openRouterEnabled.isDirty || grokEnabled.isDirty || antigravityEnabled.isDirty
+            showReset: claudeEnabled.isDirty || codexEnabled.isDirty || openCodeEnabled.isDirty || deepSeekEnabled.isDirty || openRouterEnabled.isDirty || ollamaEnabled.isDirty || grokEnabled.isDirty || antigravityEnabled.isDirty
             onResetClicked: {
                 claudeEnabled.resetToDefault()
                 codexEnabled.resetToDefault()
                 openCodeEnabled.resetToDefault()
                 deepSeekEnabled.resetToDefault()
                 openRouterEnabled.resetToDefault()
+                ollamaEnabled.resetToDefault()
                 grokEnabled.resetToDefault()
                 antigravityEnabled.resetToDefault()
             }
@@ -68,6 +69,16 @@ PluginSettings {
             settingKey: "openRouterEnabled"
             label: I18n.tr("OpenRouter")
             description: I18n.tr("Show your OpenRouter account credit balance.")
+            defaultValue: true
+        }
+
+        Separator {}
+
+        ToggleSettingPlus {
+            id: ollamaEnabled
+            settingKey: "ollamaEnabled"
+            label: I18n.tr("Ollama Cloud")
+            description: I18n.tr("Show your Ollama Cloud plan and monthly included usage.")
             defaultValue: true
         }
 
@@ -157,11 +168,13 @@ PluginSettings {
         SectionTitle {
             text: I18n.tr("Credentials")
             icon: "key"
-            showReset: deepSeekApiKey.isDirty || openRouterApiKey.isDirty || openCodeApiKey.isDirty
+            showReset: deepSeekApiKey.isDirty || openRouterApiKey.isDirty || openCodeApiKey.isDirty || ollamaApiKey.isDirty || ollamaSessionCookie.isDirty
             onResetClicked: {
                 deepSeekApiKey.resetToDefault()
                 openRouterApiKey.resetToDefault()
                 openCodeApiKey.resetToDefault()
+                ollamaApiKey.resetToDefault()
+                ollamaSessionCookie.resetToDefault()
             }
         }
 
@@ -193,6 +206,26 @@ PluginSettings {
             label: I18n.tr("OpenCode Go API Key")
             description: I18n.tr("Optional. Leave empty to use the key from opencode /connect.")
             placeholder: "sk-..."
+            defaultValue: ""
+        }
+
+        Separator {}
+
+        StringSettingPlus {
+            id: ollamaApiKey
+            settingKey: "ollamaApiKey"
+            label: I18n.tr("Ollama Cloud API Key")
+            description: I18n.tr("Optional. Create a key at ollama.com/settings/keys. Shows your plan name.")
+            defaultValue: ""
+        }
+
+        Separator {}
+
+        StringSettingPlus {
+            id: ollamaSessionCookie
+            settingKey: "ollamaSessionCookie"
+            label: I18n.tr("Ollama Cloud Session Cookie")
+            description: I18n.tr("Optional. Paste the __Secure-session cookie value from your browser after signing in at ollama.com to show monthly usage. Grants full account access - keep it private.")
             defaultValue: ""
         }
     }
